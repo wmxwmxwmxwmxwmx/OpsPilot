@@ -1,19 +1,17 @@
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from time import perf_counter
-from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 
 from app.agent.loop import Agent
 from app.agent.schemas import AgentExecutionError
 from app.api.diagnose import router as diagnose_router
 from app.api.health import router as health_router
 from app.core.config import Settings
-from app.core.logging import configure_logging, log_event, request_id_context
+from app.core.logging import RequestLoggingMiddleware, configure_logging, log_event
 from app.llm.base import BaseLLM
 from app.llm.mock import MockLLM
 from app.llm.openai_compatible import OpenAICompatibleLLM
@@ -65,31 +63,7 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
             "code": "invalid_request", "message": "请求格式错误；message 必须为 1–4000 字符的非空字符串。"
         }})
 
-    @application.middleware("http")
-    async def observe_request(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-        request_id = uuid4().hex
-        token = request_id_context.set(request_id)
-        started = perf_counter()
-        status_code = 500
-        log_event("request_start", method=request.method)
-        try:
-            try:
-                response = await call_next(request)
-            except Exception:
-                log_event("request_failure", code="internal_error")
-                response = JSONResponse(status_code=500, content={"error": {
-                    "code": "internal_error", "message": "服务暂时不可用。"
-                }})
-            status_code = response.status_code
-            response.headers["X-Request-ID"] = request_id
-            return response
-        finally:
-            # Log the matched route template, not arbitrary paths or query strings.
-            route = request.scope.get("route")
-            log_event("request_finish", status_code=status_code,
-                      route=getattr(route, "path", "unmatched"),
-                      latency_ms=round((perf_counter() - started) * 1000, 3))
-            request_id_context.reset(token)
+    application.add_middleware(RequestLoggingMiddleware)
 
     return application
 

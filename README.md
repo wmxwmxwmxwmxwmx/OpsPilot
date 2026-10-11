@@ -2,16 +2,18 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-V0.1 是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
+当前版本 **V0.2-M1（SSE Streaming）**，在 V0.1 基础上新增 Agent 执行事件流。
+这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
 
-## V0.1 能做什么
+## 当前能做什么
 
 - 接收故障描述，经过模型选工具、执行、Observation 回传、多轮调用，返回最终诊断。
 - 提供三个只读 Mock Tools；模型可一次返回多个调用，应用按顺序执行。
 - 支持 MockLLM 和 OpenAI-compatible Chat Completions 两种模式。
 - 提供轮数上限、模型/工具超时、参数校验、错误 Observation、结构化日志和自动化测试。
+- 支持普通 JSON 诊断和 POST SSE 诊断，两者复用同一套 Agent 执行逻辑。
 - `steps` 仅包含实际 Tool Call / Tool Result，不返回隐藏推理或中间模型文字。
 
 ## 架构与目录
@@ -46,8 +48,8 @@ Observation ──────────────────────�
 ```text
 app/
 ├── main.py                 # 应用组装、生命周期、中间件、HTTP 错误映射
-├── api/                    # /health 和 /api/v1/diagnose
-├── agent/                  # loop.py、schemas.py、prompts.py
+├── api/                    # /health、/api/v1/diagnose、/api/v1/diagnose/stream、sse.py
+├── agent/                  # loop.py、events.py、schemas.py、prompts.py
 ├── llm/                    # base.py、mock.py、openai_compatible.py
 ├── tools/                  # registry.py 和三个 Mock Tool
 └── core/                   # config.py、logging.py
@@ -60,7 +62,7 @@ LEARNING.md                 # 作者学习问答及代码定位
 
 ## Agent Loop
 
-核心在 [`app/agent/loop.py`](app/agent/loop.py) 的 `Agent.run()`，HTTP 路由只负责接收和返回数据。
+核心在 [`app/agent/loop.py`](app/agent/loop.py) 的 `Agent.stream()`；`Agent.run()` 消费同一事件流组装原有 JSON 响应，HTTP/SSE 编码留在 API 层。
 
 1. 为每个请求创建独立 `messages` 和 `steps`，放入系统提示与用户描述。
 2. 从注册表导出工具名称、描述和 Pydantic JSON Schema，传给 `BaseLLM.generate()`。
@@ -71,7 +73,7 @@ LEARNING.md                 # 作者学习问答及代码定位
 7. 没有 Tool Call 且答案非空时正常结束；达到 `MAX_STEPS` 仍无答案则抛出 `AgentExecutionError`。
 
 `MAX_STEPS=6` 指 **LLM 调用轮数**，不是 `steps` 事件数。一次工具执行产生两个事件。
-订单慢场景正常需要 3 轮 LLM、2 次 Tool、4 个事件。设置为 2 会在收集完两项证据后失败，
+订单慢场景正常需要 3 轮 LLM、2 次 Tool、4 个工具事件（SSE 另外包含 `agent_start` 和 `final`）。设置为 2 会在收集完两项证据后失败，
 因为没有剩余轮次让 LLM 生成最终答案；上限不会被额外的“最后总结”调用绕过。
 每轮最多接受 16 个 Tool Call，并对每次 LLM / Tool 执行设置超时。
 
@@ -232,6 +234,7 @@ Python 应来自 `/home/wmx/miniconda3/envs/opspilot/bin/python`，版本是 3.1
 
 - `GET /health`：返回 `{"status":"ok","service":"opspilot"}`，只表示进程健康，不检查供应商可用性。
 - `POST /api/v1/diagnose`：请求 `{"message":"订单接口突然变慢，请帮我排查"}`。
+- `POST /api/v1/diagnose/stream`：相同请求体，返回 `text/event-stream` 执行事件。
 - `GET /docs`：交互式 API 文档。
 
 ```bash
@@ -258,6 +261,149 @@ curl -X POST http://localhost:8000/api/v1/diagnose \
 `message` 会去除首尾空白，必须是 1–4000 字符的非空字符串；多余字段也会被拒绝。
 每个响应带有应用生成的 `X-Request-ID`，可关联同一次请求的日志。
 
+## V0.2-M1：SSE 执行事件流
+
+这是 **Agent 执行事件 Streaming**；`BaseLLM.generate()` 仍等待整次模型响应，没有 token 级输出。
+
+```mermaid
+flowchart TD
+    HTTP[HTTP POST + DiagnoseRequest 校验] --> JSON["POST /api/v1/diagnose"]
+    HTTP --> SSE["POST /api/v1/diagnose/stream"]
+    JSON --> RUN[Agent.run 消费事件并收集 steps]
+    RUN --> STREAM[Agent.stream 单一执行循环]
+    SSE --> CONSUMER[stream_diagnosis 消费事件]
+    CONSUMER --> STREAM
+    STREAM --> LLM[LLM.generate + 轮数上限和超时]
+    LLM --> VALIDATE[ToolRegistry 查找和参数校验]
+    VALIDATE --> CALL[tool_call 事件]
+    CALL --> EXEC[顺序执行 Tool + 超时和输出 JSON 校验]
+    EXEC --> RESULT[tool_result 事件 + Observation]
+    RESULT --> LLM
+    LLM --> FINAL[final 事件]
+    STREAM --> EVENTS[结构化 AgentEvent]
+    EVENTS --> COLLECT[run 返回 answer + steps]
+    COLLECT --> JSONCLIENT[普通 JSON 客户端]
+    EVENTS --> ENCODE[encode_sse 编码]
+    CONSUMER --> ERROR[执行异常转安全 error 事件]
+    ERROR --> ENCODE
+    ENCODE --> RESPONSE[SSEResponse / StreamingResponse]
+    RESPONSE --> CLIENT[SSE 客户端]
+    CLIENT --> DISCONNECT[断连取消、关闭生成器、finally 日志清理]
+```
+
+[`app/agent/events.py`](app/agent/events.py) 定义按 `type` 判别的 Pydantic 联合类型。
+工具事件直接复用 `ToolCallStep`、`ToolResultStep`，避免两套字段逐渐不一致。
+
+| SSE event | data 字段 | 含义 |
+|---|---|---|
+| `agent_start` | `max_steps` | 执行开始；上限仍表示模型调用轮数 |
+| `tool_call` | `tool`, `call_id`, `arguments` | 准备调用；仅包含已校验参数，坏参数或未知工具为 `{}` |
+| `tool_result` | `tool`, `call_id`, `success`, `result` 或 `error` | 工具执行结果；失败仍作为 Observation 交还模型 |
+| `final` | `answer` | 正常终止，只发送一次 |
+| `error` | `code`, `message` | 执行失败终止，只发送一次 |
+
+内部模型保留 `type`，SSE 把它写到 `event:` 行，`data:` 是去除 `type`、省略空值的标准 JSON。
+每条消息以 `\n\n` 结束。中文直接编码为 UTF-8，字符串中的回车、换行、引号等由 JSON 转义，
+不会插入新的 SSE 帧。客户端应使用 `call_id` 匹配调用与结果。
+
+启动服务后调用（`-N` 关闭 curl 输出缓冲）：
+
+```bash
+python -m uvicorn app.main:app --reload --no-access-log
+
+curl -N -X POST http://localhost:8000/api/v1/diagnose/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"订单接口突然变慢"}'
+
+curl -N -X POST http://localhost:8000/api/v1/diagnose/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Redis缓存出现异常，请帮我诊断"}'
+```
+
+订单场景共 6 条事件，Redis 场景共 8 条事件，额外包含 `get_redis_metrics` 的调用与结果。
+订单场景响应节选（省略 MySQL 调用/结果，缩短答案）：
+
+```text
+event: agent_start
+data: {"max_steps":6}
+
+event: tool_call
+data: {"tool":"get_system_metrics","call_id":"mock_call_1","arguments":{}}
+
+event: tool_result
+data: {"tool":"get_system_metrics","call_id":"mock_call_1","success":true,"result":{"cpu_percent":35.2,"memory_percent":61.4,"load_average":1.28}}
+
+event: final
+data: {"answer":"基于 Mock Data 的模拟诊断……"}
+
+```
+
+响应包含 `Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache`、
+`X-Accel-Buffering: no`。浏览器原生 `EventSource` 不支持 POST 请求体，应使用 `fetch()`：
+
+```javascript
+const controller = new AbortController();
+const response = await fetch("/api/v1/diagnose/stream", {
+  method: "POST",
+  headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({message: "订单接口突然变慢"}),
+  signal: controller.signal,
+});
+if (!response.ok) throw new Error(`HTTP ${response.status}`);
+const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+let pending = "";
+let terminal = false;
+try {
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    pending += value; // 网络 chunk 和 SSE 消息边界不一定重合。
+    let boundary;
+    while ((boundary = pending.indexOf("\n\n")) !== -1) {
+      const frame = pending.slice(0, boundary);
+      pending = pending.slice(boundary + 2);
+      const lines = frame.split("\n");
+      const event = lines.find(line => line.startsWith("event: ")).slice(7);
+      const data = JSON.parse(lines.find(line => line.startsWith("data: ")).slice(6));
+      console.log(event, data);
+      if (event === "final" || event === "error") terminal = true;
+    }
+  }
+  if (!terminal) throw new Error("诊断流提前断开，未收到终止事件");
+} finally {
+  await reader.cancel();
+  reader.releaseLock();
+}
+// 在取消按钮的事件处理器中调用 controller.abort()。
+```
+
+此解析示例针对本服务固定的单行 `data:`、LF 分帧格式；没有添加 GET 接口。
+
+请求校验在发送响应前完成，错误仍是 HTTP 422 JSON。流开始后 HTTP 通常已经是 200，
+无法再改为 502/503/504；业务失败由 API 消费层把 `AgentExecutionError` 转成 `error`，例如：
+
+```text
+event: error
+data: {"code":"llm_timeout","message":"模型调用超时，请稍后重试。"}
+
+```
+
+正常完成只有 `final`，执行失败只有 `error`；工具失败事件本身不终止 Agent。
+异常文案固定，不回传 Provider 原始异常、traceback 或坏参数。原 JSON API 继续抛出业务异常，
+由原 HTTP 异常处理器映射状态码及 `steps`。
+
+[`app/api/sse.py`](app/api/sse.py) 复用 Starlette 的逐块发送实现，同时用框架已有的 AnyIO
+任务组管理发送与断连监听，任一结束即取消另一方，所有任务都在响应结束前收回。
+监听覆盖 ASGI 2.3/2.4，模型或工具尚在等待时也可取消，不必等下次发送失败。
+`aclosing` 从 SSE 消费器到 Agent、工具生成器逐层关闭；`CancelledError` 不转换成成功或错误事件。
+Agent 在模型和工具调用前设置协作取消点，Mock 工具无真实 IO 时同样能响应取消。
+直接消费 `Agent.stream()` 并提前退出的调用方也必须使用 `async with aclosing(...)`。
+
+当前限制：没有心跳、事件持久化、事件 ID、断点续传或自动重连；断连后不保证收到终止事件，
+客户端应把缺少 `final`/`error` 的 EOF 视为未完成。实际到达速度还受网络和代理缓冲影响。
+没有引入 Redis Session、数据库、真实监控或新的 LLM 协议；取消依赖下游异步调用配合，
+阻塞同步 IO 不应直接放在事件循环中。
+
 ## 错误处理与日志
 
 | 情况 | 行为 |
@@ -272,11 +418,14 @@ curl -X POST http://localhost:8000/api/v1/diagnose \
 | 未预期应用错误 | HTTP 500，固定 `internal_error` 文案 |
 
 工具失败是可恢复事件，模型可以修正调用或结束并说明不足；最终答复 HTTP 200 不代表故障已解决。
+上表的 HTTP 错误码适用于普通诊断接口；SSE 开始后的失败使用 `error` 事件。
 取消信号不会被 `except Exception` 吞掉。程序不向客户端返回 traceback 或第三方异常正文。
 
 `app/core/logging.py` 输出 JSON Lines，记录 `request_start/finish`、`agent_start/step/finish`、
 `tool_start/success/failure`、工具耗时、Agent 总耗时和错误码。日志仅接收允许的运行元数据，
 不记录 API Key、Authorization、输入正文、模型输出、工具结果或异常原文。
+请求日志中间件使用纯 ASGI 调用，`request_finish` 在响应体完成或断连清理后记录，
+`X-Request-ID` 和日志上下文贯穿整个事件流；HTTP 200 仅表示流已建立，诊断结果看终止事件。
 日志中的 `route` 是匹配的路由模板，不是含 query 的原始 URL。没有 Prometheus、Grafana 或 Langfuse 集成。
 
 ## Tests
@@ -285,10 +434,18 @@ curl -X POST http://localhost:8000/api/v1/diagnose \
 conda run -n opspilot pytest -v
 ```
 
-首次完整验收：**60 passed**。测试覆盖三个工具、注册表、完整多轮流程、观察值改变答案、并发隔离、
+V0.1 修改前基线：**60 passed**。V0.2-M1 完整验收：**98 passed，0 failed**（保留全部旧测试，新增 38 项）。测试覆盖三个工具、注册表、完整多轮流程、观察值改变答案、并发隔离、
 请求校验、MAX_STEPS、未知工具、坏参数、工具异常/超时、模型异常/超时、取消传播、日志脱敏、
-真实适配器的请求协议及错误响应。`tests/conftest.py` 隔离配置并禁止真实 HTTP transport；
+真实适配器的请求协议及错误响应。
+新增 [`tests/test_stream.py`](tests/test_stream.py) 覆盖 SSE 顺序、JSON 转义、错误终止、
+工具失败 Observation、并发隔离、旧接口等价、OpenAPI、提前关闭及 ASGI 2.3/2.4 断连。
+取消测试通过事件同步触发，不依赖 sleep 计时断言；ASGITransport 只用来验证完整响应，
+不据此声称验证真实网络的逐事件到达时间。`tests/conftest.py` 隔离配置并禁止真实 HTTP transport；
 API 用 ASGITransport，供应商模拟用 MockTransport，没有调用真实模型 API。
+
+本次还实际启动了 Mock 模式 Uvicorn（`--reload --no-access-log`），使用 `curl -N` 验证
+订单与 Redis SSE：分别返回 6、8 条事件，Redis 包含 `get_redis_metrics` 调用/结果；
+原 JSON 接口返回 `answer + 4 steps`，与订单 SSE 的答案及工具事件一致。验证后已停止服务。
 
 ## Docker
 
@@ -305,7 +462,7 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 - 所有运维数据都是 Mock，不能据此判断生产故障；MockLLM 的规划规则只用于演示。
 - 真实供应商仅做离线协议测试，未完成带真实 Key 的联调；专有 reasoning 续传等扩展不支持。
-- 没有身份认证、限流、持久化、会话、Streaming、总请求时间预算或全局并发控制；不应直接暴露到公网。
+- 没有身份认证、限流、持久化、会话、LLM token Streaming、总请求时间预算或全局并发控制；不应直接暴露到公网。
 - 有轮数与单次超时保护，但多工具请求仍可较慢；同一轮多个工具按顺序执行。
 - 模型输出只是建议，未实现全面的敏感内容检测；未来接入真实工具前需要输出脱敏和数据权限控制。
   当前 steps 中只有固定 Mock Data；有效工具参数及输出将来若含 Secret，必须在工具边界显式处理。
@@ -314,11 +471,12 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 ## Roadmap
 
-以下仅是规划，V0.1 没有提前实现。
+除已标注完成的 M1 外，以下功能仍是规划。
 
 ### V0.2
 
-SSE Streaming、Redis Session、Redis Cache、PostgreSQL Incident Persistence。
+- **M1 已完成**：SSE Agent 执行事件流。
+- M2：Redis Session；后续 Redis Cache、PostgreSQL Incident Persistence。
 
 ### V0.3
 
@@ -332,5 +490,10 @@ RAG Runbook、MCP、Prometheus、Grafana、Agent Trace。
 
 pytest integration tests、k6 load testing、Mock LLM benchmark、performance tuning。
 
-最值得接着完成的三个功能：SSE 事件流、Redis Session、PostgreSQL 故障记录持久化。
+接下来可实现 Redis Session、Redis Cache 和 PostgreSQL 故障记录持久化。
+M2 可在 `get_agent`/请求服务层解析 session_id、加载上下文，再显式传给 Agent；
+现阶段 `stream(message)` 仍为无状态单次诊断，需先定义会话输入和历史保存接口。
+会话服务可消费 AgentEvent 记录运行进度，但完整 LLM 历史应通过显式上下文接口保存，
+不能仅靠公开事件重建。Redis Client 由 `app/main.py` 的 lifespan 管理，
+不要把可变会话历史存进共享 Agent 实例；同一 session 的并发、取消和失败写入策略需要专门设计。
 先完成当前层的学习问答：[我作为 OpsPilot 作者必须能回答的问题](LEARNING.md)。
