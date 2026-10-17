@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import aclosing
 from time import perf_counter
 
@@ -13,6 +13,7 @@ from app.agent.schemas import (
 )
 from app.core.logging import log_event
 from app.llm.base import BaseLLM, Message, ToolCall, ToolDefinition
+from app.session.schemas import ConversationTurn
 from app.tools.registry import ToolRegistry
 
 
@@ -29,10 +30,10 @@ class Agent:
         self.llm_timeout_seconds = llm_timeout_seconds
         self.tool_timeout_seconds = tool_timeout_seconds
 
-    async def run(self, message: str) -> DiagnoseResponse:
+    async def run(self, message: str, history: Sequence[ConversationTurn] | None = None) -> DiagnoseResponse:
         """Collect the same execution events for the original JSON API."""
         steps: list[Step] = []
-        async with aclosing(self.stream(message)) as events:
+        async with aclosing(self.stream(message, history=history)) as events:
             async for event in events:
                 if isinstance(event, (ToolCallStep, ToolResultStep)):
                     steps.append(event)
@@ -40,15 +41,20 @@ class Agent:
                     return DiagnoseResponse(answer=event.answer, steps=steps)
         raise RuntimeError("Agent ended without a final answer")
 
-    async def stream(self, message: str) -> AsyncIterator[AgentEvent]:
+    async def stream(
+        self, message: str, history: Sequence[ConversationTurn] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
         """Yield execution events; failures raise AgentExecutionError, never HTTP.
 
         Consumers that stop early must close this async generator (aclosing).
         Cancellation and GeneratorExit propagate through all execution boundaries.
         """
         # All mutable conversation state is request-local, including failed calls.
-        messages = [Message(role="system", content=SYSTEM_PROMPT),
-                    Message(role="user", content=message)]
+        messages = [Message(role="system", content=SYSTEM_PROMPT)]
+        for turn in history or ():
+            validated = ConversationTurn.model_validate(turn)
+            messages.append(Message(role=validated.role, content=validated.content))
+        messages.append(Message(role="user", content=message))
         steps: list[Step] = []
         definitions = [ToolDefinition(name=tool.name, description=tool.description,
                                      parameters=tool.input_schema.model_json_schema())

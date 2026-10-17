@@ -9,8 +9,10 @@ class MockLLM(BaseLLM):
     async def generate(
         self, messages: list[Message], tools: list[ToolDefinition]
     ) -> LLMResponse:
-        observations = [json.loads(m.content or "{}") for m in messages if m.role == "tool"]
-        user_message = next(m.content or "" for m in messages if m.role == "user")
+        current_user = max(i for i, m in enumerate(messages) if m.role == "user")
+        user_message = messages[current_user].content or ""
+        observations = [json.loads(m.content or "{}") for m in messages[current_user + 1:]
+                        if m.role == "tool"]
         plan = ["get_system_metrics", "get_mysql_slow_queries"]
         if "redis" in user_message.lower() or "缓存" in user_message:
             plan.append("get_redis_metrics")

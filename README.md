@@ -2,7 +2,7 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-当前版本 **V0.2-M1（SSE Streaming）**，在 V0.1 基础上新增 Agent 执行事件流。
+当前版本 **V0.2-M2（Redis Conversation Session）**，保留 M1 SSE 并新增可选的 Redis 多轮对话。
 这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
@@ -14,6 +14,7 @@
 - 支持 MockLLM 和 OpenAI-compatible Chat Completions 两种模式。
 - 提供轮数上限、模型/工具超时、参数校验、错误 Observation、结构化日志和自动化测试。
 - 支持普通 JSON 诊断和 POST SSE 诊断，两者复用同一套 Agent 执行逻辑。
+- 可选 Redis Session：完整对话轮次、滑动 TTL、版本并发控制、提交成功后返回最终答案。
 - `steps` 仅包含实际 Tool Call / Tool Result，不返回隐藏推理或中间模型文字。
 
 ## 架构与目录
@@ -50,6 +51,8 @@ app/
 ├── main.py                 # 应用组装、生命周期、中间件、HTTP 错误映射
 ├── api/                    # /health、/api/v1/diagnose、/api/v1/diagnose/stream、sse.py
 ├── agent/                  # loop.py、events.py、schemas.py、prompts.py
+├── session/               # 对话 Schema、Redis Repository、安全错误和存储脱敏
+├── services/              # DiagnosisService 协调执行与会话提交
 ├── llm/                    # base.py、mock.py、openai_compatible.py
 ├── tools/                  # registry.py 和三个 Mock Tool
 └── core/                   # config.py、logging.py
@@ -64,7 +67,7 @@ LEARNING.md                 # 作者学习问答及代码定位
 
 核心在 [`app/agent/loop.py`](app/agent/loop.py) 的 `Agent.stream()`；`Agent.run()` 消费同一事件流组装原有 JSON 响应，HTTP/SSE 编码留在 API 层。
 
-1. 为每个请求创建独立 `messages` 和 `steps`，放入系统提示与用户描述。
+1. 为每个请求创建独立 `messages` 和 `steps`，放入系统提示、可选的对话历史与当前用户描述。
 2. 从注册表导出工具名称、描述和 Pydantic JSON Schema，传给 `BaseLLM.generate()`。
 3. LLM 返回工具调用时，将 assistant 调用消息加入上下文。
 4. 按名称查找工具，验证 JSON 参数，再 `await tool.execute(arguments)`。
@@ -112,7 +115,7 @@ MySQL、Redis、Prometheus、HTTP API、日志系统属于 IO-bound 操作，统
 
 ## MockLLM
 
-[`app/llm/mock.py`](app/llm/mock.py) 根据传入的 Observation 确定下一步，无共享轮次计数。
+[`app/llm/mock.py`](app/llm/mock.py) 根据最新 User 问题和其后的 Observation 确定下一步，无共享轮次计数。
 订单故障确定性选择：系统指标 → MySQL 慢查询 → 最终答案；包含 `redis` 或“缓存”的描述会额外调用 Redis。
 工具顺序属于 MockLLM 的模拟策略，Agent Loop 没有硬编码这些工具。
 
@@ -235,6 +238,7 @@ Python 应来自 `/home/wmx/miniconda3/envs/opspilot/bin/python`，版本是 3.1
 - `GET /health`：返回 `{"status":"ok","service":"opspilot"}`，只表示进程健康，不检查供应商可用性。
 - `POST /api/v1/diagnose`：请求 `{"message":"订单接口突然变慢，请帮我排查"}`。
 - `POST /api/v1/diagnose/stream`：相同请求体，返回 `text/event-stream` 执行事件。
+- `POST /api/v1/sessions`：显式创建 Redis 会话（默认禁用），返回 HTTP 201。
 - `GET /docs`：交互式 API 文档。
 
 ```bash
@@ -401,8 +405,197 @@ Agent 在模型和工具调用前设置协作取消点，Mock 工具无真实 IO
 
 当前限制：没有心跳、事件持久化、事件 ID、断点续传或自动重连；断连后不保证收到终止事件，
 客户端应把缺少 `final`/`error` 的 EOF 视为未完成。实际到达速度还受网络和代理缓冲影响。
-没有引入 Redis Session、数据库、真实监控或新的 LLM 协议；取消依赖下游异步调用配合，
+M2 已增量接入可选 Redis Session；尚无长期数据库记录、真实监控或新的 LLM 协议。取消依赖下游异步调用配合，
 阻塞同步 IO 不应直接放在事件循环中。
+
+## V0.2-M2：Redis Conversation Session
+
+Session 用于跨请求恢复短期对话上下文，与 Redis Mock Tool、业务指标 Cache、长期故障记录是不同功能。
+默认 `SESSION_ENABLED=false`。不传 `session_id`（或传 `null`）时不创建、不读取、不写入 Redis，
+即使启用了 Session 且 Redis 故障，无状态普通诊断和 SSE 仍可使用。
+
+### 开发 Redis
+
+使用已有 Redis 时不要改配置或清空数据库。以下两种方式任选其一，先检查端口/容器名没有占用：
+
+```bash
+ss -ltn 'sport = :16379'
+docker ps -a --filter name=opspilot-redis-m2
+# 有输出表示需要先检查，不要自动停止已有服务。
+docker run --rm --name opspilot-redis-m2 \
+  -p 127.0.0.1:16379:6379 redis:7.4.11 \
+  redis-server --save "" --appendonly no
+# 另一终端停止刚创建的容器：
+docker stop opspilot-redis-m2
+```
+
+本次环境没有 Redis Server/CLI，Docker Desktop 的 WSL 集成也未启用；实际使用官方源码在 `/tmp`
+构建 Redis 7.4.11，未执行 `make install`、安装系统服务或修改内核配置。可复现方式（需要已有 gcc/make）：
+
+```bash
+redis_build_dir=$(mktemp -d /tmp/opspilot-redis.XXXXXX)
+curl -fL https://download.redis.io/releases/redis-7.4.11.tar.gz \
+  -o "$redis_build_dir/redis.tar.gz"
+tar -xzf "$redis_build_dir/redis.tar.gz" -C "$redis_build_dir"
+make -C "$redis_build_dir/redis-7.4.11" -j2 MALLOC=libc OPTIMIZATION=-O2 \
+  REDIS_CFLAGS= REDIS_LDFLAGS= redis-server redis-cli
+"$redis_build_dir/redis-7.4.11/src/redis-server" \
+  --bind 127.0.0.1 --port 16379 --save "" --appendonly no --dir "$redis_build_dir"
+# 前台进程按 Ctrl+C 停止；此临时实例不做磁盘持久化。
+```
+
+源码来自 [Redis 官方发行目录](https://download.redis.io/releases/)。不要执行 FLUSHALL/FLUSHDB。
+以上启动方式仅用于本机开发；Session 随 TTL 或无持久化 Redis 重启丢失。
+
+### 配置与连续请求
+
+在现有 Conda 环境更新依赖：`pip install -e ".[dev]"`。redis-py 是运行依赖，fakeredis 仅是测试依赖。
+`.env.example` 包含以下配置；`REDIS_URL` 用 `SecretStr` 保存，拒绝 query 配置覆盖：
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `SESSION_ENABLED` | `false` | 禁用时创建/使用会话返回 `session_disabled` |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | 支持 redis/rediss；本页隔离实例用 16379 |
+| `SESSION_TTL_SECONDS` | `1800` | 1–604800 秒，成功交互后滑动续期 |
+| `SESSION_MAX_TURNS` | `10` | 保留最近 1–100 轮完整 User/Assistant 对话 |
+| `SESSION_MAX_MESSAGE_CHARS` | `16000` | 存储单条消息字符上限，配置范围 4000–32000；HTTP 输入仍最多 4000 字符 |
+| `SESSION_MAX_BYTES` | `262144` | 整个 JSON 的 UTF-8 字节上限，配置范围 1024–1048576 |
+
+```bash
+SESSION_ENABLED=true REDIS_URL=redis://127.0.0.1:16379/0 LLM_MODE=mock \
+  python -m uvicorn app.main:app --host 127.0.0.1 --port 18000 --no-access-log
+```
+
+另一个已激活 opspilot 环境的终端：
+
+```bash
+# HTTP 201；无请求体或 {} 均可，不接受客户端指定 session_id。
+session_id=$(curl -fsS -X POST http://127.0.0.1:18000/api/v1/sessions \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
+
+curl -sS http://127.0.0.1:18000/api/v1/diagnose \
+  -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$session_id\",\"message\":\"订单接口突然变慢\"}"
+
+curl -sS http://127.0.0.1:18000/api/v1/diagnose \
+  -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$session_id\",\"message\":\"那 Redis 缓存方面呢？\"}"
+
+curl -N -sS http://127.0.0.1:18000/api/v1/diagnose/stream \
+  -H 'Content-Type: application/json' \
+  -d "{\"session_id\":\"$session_id\",\"message\":\"继续检查 Redis 缓存\"}"
+
+# 使用已有 redis-cli（源码方式位于 $redis_build_dir/redis-7.4.11/src/redis-cli）：
+redis-cli -p 16379 GET "opspilot:session:$session_id"
+redis-cli -p 16379 TTL "opspilot:session:$session_id"
+```
+
+创建响应为 `{"session_id":"服务器生成的 UUID4","expires_in_seconds":1800}`。
+普通诊断响应仍只有 `answer`、`steps`；SSE 仍是 M1 的五类事件，不增加 Session 事件。
+
+### 三条调用链
+
+```mermaid
+flowchart LR
+    A[无 session_id 的普通请求] --> B[DiagnosisService.run]
+    B --> C[Agent.run 消费 Agent.stream]
+    C --> D[LLM 和工具]
+    D --> E[answer + steps]
+```
+
+```mermaid
+flowchart LR
+    A[携带 session_id 的普通请求] --> B[Repository.load 获取快照和版本]
+    B --> C[Agent.run 注入历史并执行]
+    C --> D[Repository.commit 原子保存完整对话对]
+    D --> E[提交成功后返回 answer + steps]
+```
+
+```mermaid
+flowchart TD
+    A[携带 session_id 的 SSE 请求] --> B[DiagnosisService.stream 加载会话]
+    B --> C[Agent.stream 注入历史并执行]
+    C --> D{AgentEvent}
+    D -->|普通执行事件| E[M1 SSE 编码和 StreamingResponse]
+    D -->|final| F[暂存最终答案并提交 Redis]
+    F -->|成功| E
+    F -->|失败| G[安全 error 事件]
+    G --> E
+    E --> H[客户端]
+    H -->|断连| I[M1 取消传播与生成器清理]
+```
+
+Agent 接收 `history: Sequence[ConversationTurn] | None`，构造新的消息对象：
+`System Prompt → 历史 User/Assistant 对 → 当前 User`。不在 Agent 实例上保存历史，不让 Agent 连接 Redis。
+MockLLM 读取最新 User，仅统计本次执行的工具 Observation；CapturingLLM 测试检查了实际传入的历史。
+这只验证上下文传递和模拟规划，不代表验证了真实模型的自然语言多轮理解。
+
+### 数据边界、TTL 与原子提交
+
+[`app/session/schemas.py`](app/session/schemas.py) 定义严格字段的 Pydantic 模型。
+Key 为 `opspilot:session:{UUID4}`，Value 是 `model_dump_json()` 生成的 JSON，读取用
+`model_validate_json()` 验证 UUID、版本、带 UTC 时区的时间及完整对话对。例如第二轮完成后：
+
+```json
+{
+  "session_id": "a2ce3af5-9780-44da-938b-7609de0e08ea",
+  "version": 2,
+  "messages": [
+    {"role":"user","content":"订单接口突然变慢"},
+    {"role":"assistant","content":"第一轮最终诊断（示意）"},
+    {"role":"user","content":"那 Redis 缓存方面呢？"},
+    {"role":"assistant","content":"第二轮最终诊断（示意）"}
+  ],
+  "created_at": "2026-10-12T00:00:00Z",
+  "updated_at": "2026-10-12T00:01:00Z"
+}
+```
+
+只保存 User 输入和 Assistant 最终回答，不保存 System Prompt、ToolCall、原始 Observation、
+Reasoning 或异常详情。最终回答可能包含模型总结后的指标，但不会恢复旧的工具执行状态；
+本轮模型仍需重新调用工具获取证据。会话是短期对话历史，不是执行轨迹/审计记录。
+
+[`privacy.py`](app/session/privacy.py) 在写入前移除配置中的 API Key、Redis 密码，以及常见的
+password/api_key/token 字段、Bearer、URL 凭据、私钥等形式；存储后的历史可能与原响应文字不同。
+这不是任意敏感信息识别系统，无法识别所有业务机密或 PII；不要输入敏感生产数据，真实工具接入前需专门脱敏策略。
+
+创建使用 `SET NX EX`。普通 GET、失败、冲突不会刷新 TTL；成功提交的 `SET XX EX` 同时写完整 JSON 和 TTL。
+超过轮数时按两条消息为一组裁剪；降低保留轮数后，下一次读取也只向 Agent 提供新的保留窗口，
+不会因读取而改写 Redis。单条过长或整体字节超限则拒绝提交，不截断答案或写半轮对话。
+
+[`SessionRepository.commit`](app/session/repository.py) 在 Agent 执行完之后短暂持有独立 Pipeline：
+`WATCH key → GET 并校验当前版本/存在性 → MULTI → SET XX EX → EXEC`。
+成功版本加一；版本改变或 WATCH 冲突拒绝旧结果，不自动重跑昂贵的 Agent，也不无界重试。
+执行期间过期返回 not_found；WATCH 配合 XX 防止过期会话复活。事务只包含一个 SET，JSON 与 TTL 不会部分更新。
+流水线在 finally 中 reset；仅清理阶段屏蔽 AnyIO 取消，让连接返回池，执行与提交本身仍可取消。
+使用方式参见 [redis-py 官方异步文档](https://redis.io/docs/latest/develop/clients/redis-py/async/)。
+
+[`app/main.py`](app/main.py) 在 lifespan 中按需创建一个 `redis.asyncio.Redis`，复用最多 20 个连接，
+连接和命令超时各 2 秒、关闭自动重试，退出时 `await aclose()`。创建客户端不进行启动 PING，
+Redis 不可用不会阻止无状态功能启动；第一次 Session IO 才会建立连接并报告故障。
+
+### 错误与一致性边界
+
+| 情况 | 普通 HTTP API | 已开始的 SSE |
+|---|---|---|
+| UUID4 不合法 | 422 `invalid_request` | 响应开始前同样 422 JSON |
+| Session 功能关闭 | 503 `session_disabled` | `error` 同码 |
+| 会话不存在/已过期 | 404 `session_not_found` | `error` 同码 |
+| 同一会话并发冲突 | 409 `session_conflict` | `error` 同码 |
+| Redis 故障 | 503 `session_storage_error` | `error` 同码 |
+| Redis JSON/Schema 损坏 | 503 `session_data_error` | `error` 同码 |
+| 会话大小超限 | 413 `session_too_large` | `error` 同码 |
+
+本实现 SSE 在生成器内加载会话，所以加载失败也通过 HTTP 200 后的 `error` 告知，可能没有 `agent_start`。
+客户端必须检查终止事件。Service 拦截 Agent 的 `final`，直到 Session 提交成功才向 API 交出。
+Agent 日志 `agent_finish.success` 仅表示模型诊断完成；完整有状态成功还需 `session_committed`，以及客户端收到 final。
+
+诊断失败或诊断未完成时取消，不保存当前轮次。提交已经成功后，断连不会回滚。
+EXEC 已发出但确认丢失时，客户端无法断定是否写入；因此 storage_error 不承诺“肯定没有保存”，
+本阶段没有幂等请求 ID、提交状态查询或自动恢复。冲突后需显式重新发起诊断，新请求会加载最新上下文。
+
+Session ID 只是随机标识，不是用户身份或授权。当前没有认证、会话所有权校验、限流、配额、
+Redis 高可用、token 预算或长会话摘要；开发端口只绑定 localhost，不应直接部署到公网。
 
 ## 错误处理与日志
 
@@ -434,16 +627,34 @@ Agent 在模型和工具调用前设置协作取消点，Mock 工具无真实 IO
 conda run -n opspilot pytest -v
 ```
 
-V0.1 修改前基线：**60 passed**。V0.2-M1 完整验收：**98 passed，0 failed**（保留全部旧测试，新增 38 项）。测试覆盖三个工具、注册表、完整多轮流程、观察值改变答案、并发隔离、
+V0.1 基线 60 项，V0.2-M1 完成后、本次 M2 修改前基线 **98 passed**。M2 保留所有旧测试，当前总计 **172 项**：
+默认离线运行 **166 passed，6 skipped**；真实 Redis 集成测试单独启用后 **6 passed，0 failed**；启用真实 Redis 的完整运行 **172 passed，0 failed**。测试覆盖三个工具、注册表、完整多轮流程、观察值改变答案、并发隔离、
 请求校验、MAX_STEPS、未知工具、坏参数、工具异常/超时、模型异常/超时、取消传播、日志脱敏、
 真实适配器的请求协议及错误响应。
 新增 [`tests/test_stream.py`](tests/test_stream.py) 覆盖 SSE 顺序、JSON 转义、错误终止、
 工具失败 Observation、并发隔离、旧接口等价、OpenAPI、提前关闭及 ASGI 2.3/2.4 断连。
 取消测试通过事件同步触发，不依赖 sleep 计时断言；ASGITransport 只用来验证完整响应，
 不据此声称验证真实网络的逐事件到达时间。`tests/conftest.py` 隔离配置并禁止真实 HTTP transport；
-API 用 ASGITransport，供应商模拟用 MockTransport，没有调用真实模型 API。
+API 单元测试用 ASGITransport，供应商模拟用 MockTransport，没有调用真实模型 API。
+非集成测试禁止真实 Redis TCP 连接，FakeRedis 只用于可控单元测试。
 
-本次还实际启动了 Mock 模式 Uvicorn（`--reload --no-access-log`），使用 `curl -N` 验证
+新增 `test_session_repository.py`、`test_sessions.py` 验证 Schema、TTL、裁剪、大小限制、存储脱敏、
+历史注入、Mock 最新问题、会话隔离、并发冲突、故障降级、生命周期、提交前不发 final 及断连边界。
+真实测试在 `test_redis_integration.py`，通过显式环境变量启用，不使用 FLUSHDB/FLUSHALL，
+只清理测试自己创建的 UUID Key：
+
+```bash
+OPSPILOT_TEST_REDIS_URL=redis://127.0.0.1:16379/0 pytest -v -m redis_integration
+# 同一隔离实例上运行完整测试：
+OPSPILOT_TEST_REDIS_URL=redis://127.0.0.1:16379/0 pytest -v
+```
+
+本次真实 Redis 7.4.11 集成测试覆盖 TTL、过期不复活、WATCH 与过期/并发修改、
+两个同时提交仅一个成功、EXECABORT 不部分写入、普通与 SSE 多轮 API。
+另通过真实 Uvicorn 18000 端口验证：创建时 version=0，两次普通诊断后 version=2、4 条历史；
+第三次 SSE 收到 final 时 Redis 已为 version=3、6 条历史，TTL 每次从 100 刷新回 1800。验收结束后已停止本次 Uvicorn 与独立 Redis 实例。
+
+M1 验收时还实际启动了 Mock 模式 Uvicorn（`--reload --no-access-log`），使用 `curl -N` 验证
 订单与 Redis SSE：分别返回 6、8 条事件，Redis 包含 `get_redis_metrics` 调用/结果；
 原 JSON 接口返回 `answer + 4 steps`，与订单 SSE 的答案及工具事件一致。验证后已停止服务。
 
@@ -462,7 +673,8 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 - 所有运维数据都是 Mock，不能据此判断生产故障；MockLLM 的规划规则只用于演示。
 - 真实供应商仅做离线协议测试，未完成带真实 Key 的联调；专有 reasoning 续传等扩展不支持。
-- 没有身份认证、限流、持久化、会话、LLM token Streaming、总请求时间预算或全局并发控制；不应直接暴露到公网。
+- 已有可选短期 Redis 会话；没有身份认证、会话所有权校验、限流、长期故障记录、LLM token Streaming、总请求时间预算或全局并发控制。
+- 字符/字节及轮数上限不等于模型 token 预算；没有摘要、幂等提交或冲突结果合并，不应直接暴露到公网。
 - 有轮数与单次超时保护，但多工具请求仍可较慢；同一轮多个工具按顺序执行。
 - 模型输出只是建议，未实现全面的敏感内容检测；未来接入真实工具前需要输出脱敏和数据权限控制。
   当前 steps 中只有固定 Mock Data；有效工具参数及输出将来若含 Secret，必须在工具边界显式处理。
@@ -471,12 +683,13 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 ## Roadmap
 
-除已标注完成的 M1 外，以下功能仍是规划。
+除已标注完成的 M1/M2 外，以下功能仍是规划。
 
 ### V0.2
 
 - **M1 已完成**：SSE Agent 执行事件流。
-- M2：Redis Session；后续 Redis Cache、PostgreSQL Incident Persistence。
+- **M2 已完成**：Redis Conversation Session。
+- M3：PostgreSQL Incident Persistence；Redis Cache 留待后续独立设计。
 
 ### V0.3
 
@@ -490,10 +703,8 @@ RAG Runbook、MCP、Prometheus、Grafana、Agent Trace。
 
 pytest integration tests、k6 load testing、Mock LLM benchmark、performance tuning。
 
-接下来可实现 Redis Session、Redis Cache 和 PostgreSQL 故障记录持久化。
-M2 可在 `get_agent`/请求服务层解析 session_id、加载上下文，再显式传给 Agent；
-现阶段 `stream(message)` 仍为无状态单次诊断，需先定义会话输入和历史保存接口。
-会话服务可消费 AgentEvent 记录运行进度，但完整 LLM 历史应通过显式上下文接口保存，
-不能仅靠公开事件重建。Redis Client 由 `app/main.py` 的 lifespan 管理，
-不要把可变会话历史存进共享 Agent 实例；同一 session 的并发、取消和失败写入策略需要专门设计。
+M3 可在 `DiagnosisService` 增加独立 Incident Repository，按一次执行记录输入、最终结论、
+工具事件和失败状态，PostgreSQL Client 同样由 lifespan 管理。Conversation Session 继续只保存对话。
+需要单独定义记录 ID、事件脱敏、取消/失败状态和 Redis/PostgreSQL 双写一致性，不能假设跨存储自动原子提交。
+本次未提前实现 PostgreSQL 或 Redis Cache。
 先完成当前层的学习问答：[我作为 OpsPilot 作者必须能回答的问题](LEARNING.md)。

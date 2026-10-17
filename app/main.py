@@ -1,20 +1,27 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 
 from app.agent.loop import Agent
 from app.agent.schemas import AgentExecutionError
 from app.api.diagnose import router as diagnose_router
 from app.api.health import router as health_router
+from app.api.sessions import router as sessions_router
 from app.core.config import Settings
 from app.core.logging import RequestLoggingMiddleware, configure_logging, log_event
 from app.llm.base import BaseLLM
 from app.llm.mock import MockLLM
 from app.llm.openai_compatible import OpenAICompatibleLLM
+from app.session.errors import SessionError
+from app.session.repository import SessionRepository
 from app.tools.mysql_diagnostics import MySQLDiagnosticsTool
 from app.tools.redis_diagnostics import RedisDiagnosticsTool
 from app.tools.registry import ToolRegistry
@@ -42,11 +49,39 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                 llm_timeout_seconds=config.llm_timeout_seconds,
                 tool_timeout_seconds=config.tool_timeout_seconds,
             )
-            yield
+            redis_client = None
+            application.state.sessions = None
+            try:
+                if config.session_enabled:
+                    # Lazy connection: Redis outages must not block stateless use.
+                    redis_url = config.redis_url.get_secret_value()
+                    redis_client = Redis.from_url(
+                        redis_url, decode_responses=False, socket_connect_timeout=2,
+                        socket_timeout=2, max_connections=20, retry=Retry(NoBackoff(), 0),
+                    )
+                    application.state.sessions = SessionRepository(
+                        redis_client, ttl_seconds=config.session_ttl_seconds,
+                        max_turns=config.session_max_turns,
+                        max_message_chars=config.session_max_message_chars,
+                        max_bytes=config.session_max_bytes,
+                        secrets=(config.openai_api_key.get_secret_value(),
+                                 unquote(urlsplit(redis_url).password or "")),
+                    )
+                yield
+            finally:
+                if redis_client is not None:
+                    await redis_client.aclose()
 
     application = FastAPI(title="OpsPilot", version="0.1.0", lifespan=lifespan)
     application.include_router(health_router)
     application.include_router(diagnose_router)
+    application.include_router(sessions_router)
+
+    @application.exception_handler(SessionError)
+    async def session_error_handler(request: Request, error: SessionError) -> JSONResponse:
+        return JSONResponse(status_code=error.status_code, content={"error": {
+            "code": error.code, "message": error.message,
+        }})
 
     @application.exception_handler(AgentExecutionError)
     async def agent_error_handler(request: Request, error: AgentExecutionError) -> JSONResponse:
@@ -59,8 +94,13 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
     @application.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, error: RequestValidationError) -> JSONResponse:
         log_event("request_validation_error", code="invalid_request")
+        session_error = any("session_id" in item["loc"] for item in error.errors())
+        message = ("请求格式错误；session_id 必须为服务器生成的 UUID4。" if session_error else
+                   "请求格式错误；message 必须为 1–4000 字符的非空字符串。")
+        if request.scope.get("path") == "/api/v1/sessions":
+            message = "创建会话无需参数，不接受客户端指定的会话标识或其他字段。"
         return JSONResponse(status_code=422, content={"error": {
-            "code": "invalid_request", "message": "请求格式错误；message 必须为 1–4000 字符的非空字符串。"
+            "code": "invalid_request", "message": message,
         }})
 
     application.add_middleware(RequestLoggingMiddleware)

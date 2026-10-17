@@ -1,10 +1,11 @@
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, UUID4
 
 
 class DiagnoseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    session_id: UUID4 | None = None
     message: Annotated[str, StringConstraints(
         strict=True, strip_whitespace=True, min_length=1, max_length=4000
     )]

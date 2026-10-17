@@ -18,9 +18,25 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr = SecretStr("")
     openai_base_url: str = ""
     openai_model: str = ""
+    session_enabled: bool = False
+    redis_url: SecretStr = SecretStr("redis://127.0.0.1:6379/0")
+    session_ttl_seconds: int = Field(default=1800, ge=1, le=604800)
+    session_max_turns: int = Field(default=10, ge=1, le=100)
+    session_max_message_chars: int = Field(default=16000, ge=4000, le=32000)
+    session_max_bytes: int = Field(default=262144, ge=1024, le=1048576)
 
     @model_validator(mode="after")
     def validate_provider(self) -> Self:
+        try:
+            redis_url = urlsplit(self.redis_url.get_secret_value())
+            if (redis_url.scheme not in {"redis", "rediss"} or not redis_url.hostname
+                    or redis_url.query or redis_url.fragment
+                    or (redis_url.path not in {"", "/"} and not redis_url.path[1:].isdigit())):
+                raise ValueError
+            if redis_url.port is not None and not 1 <= redis_url.port <= 65535:
+                raise ValueError
+        except ValueError:
+            raise ValueError("REDIS_URL must be a redis(s) URL with a numeric database and no query") from None
         if self.llm_mode == "openai":
             if not all((self.openai_api_key.get_secret_value().strip(),
                         self.openai_base_url.strip(), self.openai_model.strip())):

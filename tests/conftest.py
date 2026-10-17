@@ -2,13 +2,14 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
+from redis.asyncio.connection import Connection
 
 from app.core.config import Settings
 from app.main import create_app
 
 
 @pytest.fixture(autouse=True)
-def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
     for key in Settings.model_fields:
         monkeypatch.delenv(key.upper(), raising=False)
 
@@ -16,6 +17,10 @@ def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError("Tests must not use real HTTP transport")
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", deny_network)
+    if request.node.get_closest_marker("redis_integration") is None:
+        # FakeRedis overrides this TCP connection method; only explicit
+        # integration tests may open a real Redis connection.
+        monkeypatch.setattr(Connection, "_connect", deny_network)
 
 
 @pytest.fixture
