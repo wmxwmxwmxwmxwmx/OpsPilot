@@ -6,6 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 COPY pyproject.toml ./
 COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
 RUN pip install --no-cache-dir . && useradd --create-home --uid 10001 opspilot
 USER opspilot
 EXPOSE 8000

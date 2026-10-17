@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 
+import asyncpg
 import httpx
 import pytest
 from redis.asyncio.connection import Connection
@@ -21,6 +22,8 @@ def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch, request: py
         # FakeRedis overrides this TCP connection method; only explicit
         # integration tests may open a real Redis connection.
         monkeypatch.setattr(Connection, "_connect", deny_network)
+    if request.node.get_closest_marker("postgres_integration") is None:
+        monkeypatch.setattr(asyncpg, "connect", deny_network)
 
 
 @pytest.fixture

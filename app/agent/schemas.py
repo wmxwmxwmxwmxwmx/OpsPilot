@@ -33,6 +33,7 @@ Step = Annotated[ToolCallStep | ToolResultStep, Field(discriminator="type")]
 class DiagnoseResponse(BaseModel):
     answer: str
     steps: list[Step]
+    incident_id: UUID4 | None = None
 
 
 class AgentExecutionError(Exception):

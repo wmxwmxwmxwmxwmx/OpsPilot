@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, UUID4
 
 from app.agent.schemas import ToolCallStep, ToolResultStep
 
@@ -15,12 +15,15 @@ class AgentStartEvent(BaseModel):
 class FinalAnswerEvent(BaseModel):
     type: Literal["final"] = "final"
     answer: str
+    incident_id: UUID4 | None = None
 
 
 class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
     code: str
     message: str
+    incident_id: UUID4 | None = None
+    session_committed: bool | None = None
 
 
 AgentEvent = Annotated[

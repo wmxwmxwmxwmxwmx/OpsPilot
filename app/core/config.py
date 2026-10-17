@@ -4,6 +4,8 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.db.config import validate_database_url
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -24,9 +26,13 @@ class Settings(BaseSettings):
     session_max_turns: int = Field(default=10, ge=1, le=100)
     session_max_message_chars: int = Field(default=16000, ge=4000, le=32000)
     session_max_bytes: int = Field(default=262144, ge=1024, le=1048576)
+    incident_persistence_enabled: bool = False
+    database_url: SecretStr = SecretStr("")
 
     @model_validator(mode="after")
     def validate_provider(self) -> Self:
+        if self.incident_persistence_enabled:
+            validate_database_url(self.database_url.get_secret_value())
         try:
             redis_url = urlsplit(self.redis_url.get_secret_value())
             if (redis_url.scheme not in {"redis", "rediss"} or not redis_url.hostname

@@ -10,6 +10,7 @@ from app.agent.loop import Agent
 from app.agent.schemas import AgentExecutionError, DiagnoseRequest, DiagnoseResponse
 from app.api.sse import SSEResponse, encode_sse
 from app.core.logging import log_event
+from app.incident.errors import IncidentError
 from app.services.diagnosis import DiagnosisService
 from app.session.errors import SessionError
 
@@ -23,7 +24,7 @@ async def get_agent(request: Request) -> Agent:
 async def get_diagnosis_service(
     request: Request, agent: Annotated[Agent, Depends(get_agent)],
 ) -> DiagnosisService:
-    return DiagnosisService(agent, request.app.state.sessions)
+    return DiagnosisService(agent, request.app.state.sessions, request.app.state.incidents)
 
 
 @router.post("/diagnose", response_model=DiagnoseResponse, response_model_exclude_none=True)
@@ -47,6 +48,10 @@ async def stream_diagnosis(
                     return
         except (AgentExecutionError, SessionError) as error:
             yield encode_sse(ErrorEvent(code=error.code, message=error.message))
+        except IncidentError as error:
+            yield encode_sse(ErrorEvent(code=error.code, message=error.message,
+                                       incident_id=error.incident_id,
+                                       session_committed=error.session_committed))
         except Exception:
             log_event("stream_failure", code="internal_error")
             yield encode_sse(ErrorEvent(code="internal_error", message="服务暂时不可用。"))

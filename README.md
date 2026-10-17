@@ -2,7 +2,7 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-当前版本 **V0.2-M2（Redis Conversation Session）**，保留 M1 SSE 并新增可选的 Redis 多轮对话。
+当前版本 **V0.2-M3（PostgreSQL Incident Persistence）**，保留 M1 SSE、M2 Redis Session，新增可选的持久化诊断记录。
 这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
@@ -15,9 +15,19 @@
 - 提供轮数上限、模型/工具超时、参数校验、错误 Observation、结构化日志和自动化测试。
 - 支持普通 JSON 诊断和 POST SSE 诊断，两者复用同一套 Agent 执行逻辑。
 - 可选 Redis Session：完整对话轮次、滑动 TTL、版本并发控制、提交成功后返回最终答案。
+- 可选 PostgreSQL Incident：脱敏问答、受限 JSONB 摘要、独立迁移与短事务；支持无状态/有状态诊断。
 - `steps` 仅包含实际 Tool Call / Tool Result，不返回隐藏推理或中间模型文字。
 
 ## 架构与目录
+
+```text
+Client → FastAPI → DiagnosisService
+                    ├── SessionRepository → Redis（可选，短期对话）
+                    ├── Agent → LLM / Tools
+                    └── IncidentRepository → PostgreSQL（可选，长期记录）
+```
+
+Agent 内部循环：
 
 ```text
 User
@@ -52,11 +62,14 @@ app/
 ├── api/                    # /health、/api/v1/diagnose、/api/v1/diagnose/stream、sse.py
 ├── agent/                  # loop.py、events.py、schemas.py、prompts.py
 ├── session/               # 对话 Schema、Redis Repository、安全错误和存储脱敏
-├── services/              # DiagnosisService 协调执行与会话提交
+├── services/              # DiagnosisService 协调执行与双存储提交
+├── db/                    # SQLAlchemy ORM、异步连接工厂、独立迁移配置
+├── incident/              # 持久化业务 Schema、白名单摘要与 Repository
 ├── llm/                    # base.py、mock.py、openai_compatible.py
 ├── tools/                  # registry.py 和三个 Mock Tool
 └── core/                   # config.py、logging.py
-tests/                      # 全部离线测试，包括 HTTP 协议模拟
+alembic/                    # 版本化 PostgreSQL 迁移，alembic.ini 不含凭据
+tests/                      # 默认离线；真实 Redis/PostgreSQL 测试显式启用
 pyproject.toml              # 唯一 Python 依赖声明
 .env.example                # 无 Secret 的配置样例
 Dockerfile                  # 独立 Python 3.11 Runtime
@@ -621,13 +634,216 @@ Redis 高可用、token 预算或长会话摘要；开发端口只绑定 localho
 `X-Request-ID` 和日志上下文贯穿整个事件流；HTTP 200 仅表示流已建立，诊断结果看终止事件。
 日志中的 `route` 是匹配的路由模板，不是含 query 的原始 URL。没有 Prometheus、Grafana 或 Langfuse 集成。
 
+## V0.2-M3：PostgreSQL Incident Persistence
+
+`IncidentRecord` 是**一次已经完成的诊断执行**，不代表确认发生了生产事故。
+Redis Session 保存有 TTL 的对话上下文；PostgreSQL 保存独立、长期可读取的诊断记录。
+两者可以分别启用。当前全部 Tools 都是 Mock，即使选择真实 LLM，工具证据也仍是模拟数据。
+
+### 配置、启动与迁移
+
+先安装依赖：`conda run -n opspilot pip install -e ".[dev]"`。
+本次实际验证 SQLAlchemy 2.0.55、asyncpg 0.32.0、Alembic 1.20.0、Python 3.11.16。
+默认 `INCIDENT_PERSISTENCE_ENABLED=false`，不会创建 PostgreSQL Engine 或连接数据库。
+开启后，数据库故障明确报错，不静默丢弃记录。启动仅构造惰性连接池，不做 ping 或迁移。
+
+下面命令创建**新的本地专用开发容器**，不要对已有业务数据库执行初始化或降级：
+
+```bash
+# 需要已启用 WSL integration 的 Docker Desktop；本次验收未使用 Docker。
+# 交互输入本地开发密码，避免把实际密码写入命令历史。
+read -s -p 'Local PostgreSQL password: ' POSTGRES_PASSWORD
+export POSTGRES_PASSWORD
+docker run --name opspilot-m3-pg -d \
+  -e POSTGRES_USER=opspilot -e POSTGRES_PASSWORD -e POSTGRES_DB=opspilot \
+  -p 127.0.0.1:5432:5432 postgres:18
+unset POSTGRES_PASSWORD
+```
+
+在被 Git 忽略的 `.env` 中配置以下变量；示例密码只是占位，URL 中特殊字符要百分号编码：
+
+```dotenv
+INCIDENT_PERSISTENCE_ENABLED=true
+DATABASE_URL=postgresql+asyncpg://opspilot:password@127.0.0.1:5432/opspilot
+MIGRATION_DATABASE_URL=postgresql+asyncpg://opspilot:password@127.0.0.1:5432/opspilot
+```
+
+| 配置 | 使用方 | 约定 |
+|---|---|---|
+| `INCIDENT_PERSISTENCE_ENABLED` | FastAPI | 默认 false，与 SESSION_ENABLED 独立 |
+| `DATABASE_URL` | 应用 Settings / Engine | 开启时必填，SecretStr，必须使用 asyncpg |
+| `MIGRATION_DATABASE_URL` | 独立 MigrationSettings | Alembic 必填，不回退到 DATABASE_URL，不依赖 LLM 配置 |
+
+生产中让应用角色只有必要的 DML 权限，迁移使用独立 DDL 角色。先部署迁移，再启动应用：
+
+```bash
+conda run -n opspilot alembic upgrade head
+conda run -n opspilot alembic current
+conda run -n opspilot python -m uvicorn app.main:app --no-access-log
+```
+
+当前 revision 是 `0001_incident_records`。迁移使用 asyncpg Engine + `connection.run_sync()`
+适配 Alembic 的同步迁移函数；网络 IO 仍由异步驱动执行。`alembic.ini` 不存 URL。
+应用中没有 `create_all()`。Dockerfile 带有迁移文件，部署时可在同镜像中独立运行
+`alembic upgrade head`，默认容器启动命令只启动 API。
+
+`alembic downgrade base` 会删除表及记录，**只在可丢弃的测试数据库验证**；测试随后再次
+`alembic upgrade head`。迁移文件不导入可变的 ORM 模型，避免未来模型修改改变旧版本迁移。
+
+### 表结构与持久化边界
+
+实现见 [`app/db/models.py`](app/db/models.py)、[`app/incident/schemas.py`](app/incident/schemas.py)。
+
+| 字段 | PostgreSQL 类型 | 含义 |
+|---|---|---|
+| `id` | UUID，主键 | Repository 生成 UUID4，客户端不能指定 |
+| `session_id` | UUID，可空 | 本次使用的 Redis Session；无外键，过期不影响记录 |
+| `status` | VARCHAR(16) | 当前唯一值 `completed`，不支持状态更新 |
+| `question` | TEXT | 脱敏问题，1–4000 字符 |
+| `answer` | TEXT | 脱敏最终答案，1–16000 字符 |
+| `step_summary` | JSONB | 版本化、白名单、受限执行摘要 |
+| `duration_ms` | BIGINT | 单调时钟测量 Agent 执行耗时，不含 Session 读取及双存储提交 |
+| `created_at` | TIMESTAMPTZ | 开始调用 Agent 的 UTC 时间 |
+| `finished_at` | TIMESTAMPTZ | Agent 返回答案的 UTC 时间，必须不早于 created_at |
+
+除 `session_id` 外全部 NOT NULL。数据库 CHECK 限制状态、字符长度、非负耗时、时间顺序、
+JSONB 顶层形状/版本和体积。JSONB ≤ 16 KiB；Pydantic 序列化整条记录 ≤ 128 KiB；数据库额外限制
+问题、答案、JSONB 文本之和 ≤ 128 KiB。文本禁止 NUL，不截断答案后伪装完整保存。
+摘要更细的条目白名单与计数一致性由 Pydantic 验证。
+
+主键自动提供 B-tree 索引；额外索引是 `created_at` 和部分索引 `(session_id, created_at)`
+（只覆盖非空 session_id）。不对低选择性的 completed 状态建索引，也暂不建 GIN。
+
+当前只记录完整诊断，不建立 running/failed/cancelled 状态，因此没有顶层 `error_code` 列：
+工具失败码在摘要里，终止执行/存储错误通过安全日志与 HTTP/SSE 返回。工具失败后模型仍正常
+给出答案，执行状态仍可为 completed；它表示执行结束，不代表所有工具成功或结论已被验证。
+
+```json
+{
+  "schema_version": 1,
+  "tools": [
+    {"name": "get_system_metrics", "success": true, "error_code": null},
+    {"name": "get_mysql_slow_queries", "success": false, "error_code": "tool_timeout"}
+  ],
+  "tool_count": 2,
+  "truncated": false
+}
+```
+
+[`SummaryBuilder`](app/incident/summary.py) 只消费 ToolResultStep 的安全元数据，最多保留前 64 项，
+`tool_count` 仍统计全部调用（上限 1600），超过 64 项标记 `truncated=true`。
+不保存工具参数、call_id、原始结果、错误原文、内部 messages、System Prompt 或隐藏推理。
+未知名称统一为 `unregistered_tool`，未知失败码归一为 `tool_execution_error`，防止模型把秘密
+藏在元数据中。新增工具时需要审查并更新白名单。
+
+问答沿用 [`redact_content`](app/session/privacy.py)：清除已知 OpenAI Key、完整数据库/Redis URL、
+连接密码及常见显式凭据格式。答案仍可能含指标总结；基础正则不能识别任意业务机密，
+接入真实工具前仍需领域脱敏、访问权限和数据保留策略。
+
+### 完整调用链与事务
+
+```mermaid
+sequenceDiagram
+    participant H as HTTP / SSE
+    participant S as DiagnosisService
+    participant R as Redis Session（可选）
+    participant A as Agent
+    participant I as IncidentRepository
+    participant P as PostgreSQL（可选）
+    H->>S: run / stream
+    opt session_id
+        S->>R: await load（异步 IO）
+        R-->>S: 对话快照
+    end
+    S->>A: await run / async for stream
+    Note over A: LLM / Tool 异步调用，期间不借用 PostgreSQL 连接
+    A-->>H: 经 Service 转发普通 SSE 工具事件
+    A-->>S: 最终答案
+    opt session_id
+        S->>R: await commit（WATCH/MULTI/EXEC）
+    end
+    opt 开启 PostgreSQL
+        S->>I: await create_completed
+        Note over I: 生成 UUID4、脱敏、校验，尚未开始数据库事务
+        I->>P: begin → await flush / INSERT
+        I->>P: COMMIT（退出 begin 上下文）
+        P-->>I: 确认提交，归还连接
+        I-->>S: IncidentRecord
+    end
+    S-->>H: JSON 结果 / SSE final（含可选 incident_id）
+```
+
+[`DiagnosisService`](app/services/diagnosis.py) 只协调现有 Agent，未重写 Agent Loop/SSE 编码。
+JSON API 和 SSE final 只在所有启用的存储确认提交后才表示成功；关闭持久化时响应字段保持原样。
+SSE 的普通工具事件即时转发，final 在 Service 中暂存。开启持久化后成功响应多一个可选 `incident_id`。
+
+[`IncidentRepository.create_completed/get`](app/incident/repository.py) 返回 Pydantic 模型，
+不暴露 ORM；get 未找到返回 None。每次调用从同一个 `async_sessionmaker` 创建新的 AsyncSession，
+不在共享实例里保存 Session。Engine 和连接池由 lifespan 创建和关闭，`await engine.dispose()`
+释放池连接。池最多 5 个常驻 + 5 个溢出连接，等待池 2 秒、连接 2 秒、单数据库命令 5 秒。
+`database_session()` 为取消后的 close/rollback 清理屏蔽 AnyIO 取消；业务执行和 COMMIT 仍可取消。
+
+### 双存储失败矩阵
+
+| 发生位置 | Redis 结果 | PostgreSQL 结果 | 客户端行为 |
+|---|---|---|---|
+| Agent 失败 / final 前取消 | 不写本轮 | 不写记录 | 原 Agent error；取消不补发事件 |
+| Redis 冲突、过期、数据错误 | 本轮未接受 | 不调用 PostgreSQL | 原 Session error，无 final |
+| Redis 提交响应丢失 | 可能已写 | 不调用 PostgreSQL | session_storage_error，结果可能未知 |
+| 无状态：PG 连接/flush 失败 | 无 Session 操作 | 本次未提交 | incident_storage_error / incident_data_error |
+| 无状态：PG COMMIT 网络故障 | 无 Session 操作 | 可能已提交 | incident_commit_unknown |
+| 有状态：Redis 成功，PG 在 COMMIT 前失败 | 已写本轮 | 本次未提交 | incident_partial_failure |
+| 有状态：Redis 成功，PG COMMIT 结果未知 | 已写本轮 | 可能已提交 | incident_partial_unknown |
+| 两次提交均确认 | 已写（如启用） | 已写 | JSON 200 / SSE final |
+| 写入或提交期间断连取消 | 取决于取消时机 | 未提交或已提交均可能 | 无 final，不承诺回滚已经提交的写入 |
+
+Incident 失败普通 API 返回 HTTP 503（单纯超长记录为 413），SSE 已发送 HTTP 200 后用
+error 终止。错误含安全 `code`、`message`、`incident_id`（已分配时）和 `session_committed`；
+日志记录相同边界与 request ID，不记录底层异常或问答。确定的约束错误映射 data_error；
+进入 COMMIT 后的连接/超时异常保守映射 unknown。
+
+**Redis 与 PostgreSQL 之间不存在原子事务**。Redis 不会因 PG 失败自动回滚，服务不重跑 Agent、
+不自动重试写入。运维可按 incident_id 调用内部 get 核查：读到行可确认存在；暂时读不到行
+不应在原提交仍可能进行时断言失败。M3 没有公开查询 HTTP API，因为尚无认证与所有权校验。
+UUID 仅用于关联，不能代替授权。Outbox、幂等请求与一致性修复属于后续工作。
+
+### 真实 PostgreSQL 验证
+
+测试必须由环境变量显式启用，连接到名称以 `opspilot_test` 开头的专用 bootstrap 数据库，
+用户需 CREATEDB。fixture 每次创建随机 `opspilot_test_m3_<uuid>` 数据库，在其中迁移和测试，
+最后只删除该数据库；不迁移、不清空 bootstrap 数据库，也不访问已有业务数据库。
+Redis 测试只清理自己创建的随机 Key。
+
+```bash
+# 先自行创建隔离测试实例与 opspilot_test 数据库；以下地址是格式示例。
+export OPSPILOT_TEST_POSTGRES_URL='postgresql+asyncpg://test_user:password@127.0.0.1:15432/opspilot_test'
+export OPSPILOT_TEST_REDIS_URL='redis://127.0.0.1:16379/0'
+conda run -n opspilot pytest -q
+# 只运行 PostgreSQL 测试（含双存储测试）：
+conda run -n opspilot pytest -q -m postgres_integration
+unset OPSPILOT_TEST_POSTGRES_URL OPSPILOT_TEST_REDIS_URL
+```
+
+本次验收使用 `/tmp` 中独立的 PostgreSQL 18.6 / Redis 8.0.5 实例，未改动系统服务或已有数据库。
+验收后随机测试数据库及测试 Key 已清理，临时 PostgreSQL/Redis 实例已停止。
+[`test_postgres_integration.py`](tests/test_postgres_integration.py) 验证真实 INSERT/SELECT、JSONB
+`->` 与 `@>` 查询、约束拒绝及多行整体 rollback、连接归还、取消回滚、ORM/迁移一致性、
+CLI `current → downgrade base → upgrade head → current`、提交成功后丢失确认的故障注入，
+以及 Redis 会话过期后 PG 记录仍可读取。离线单元测试禁止 asyncpg 建立真实连接。
+
 ## Tests
+
+M3 开发前在项目 Conda Python 3.11 中实际运行的基线是 **166 passed、6 skipped**。
+M3 验收结果：启用隔离 PostgreSQL 与 Redis 后 **242 passed、0 skipped、0 failed**；
+默认离线 **217 passed、25 skipped、0 failed**（25 项需显式数据库配置）。原有测试全部保留，未放宽断言。
+新增 `test_incidents.py` 与 `test_postgres_integration.py` 覆盖数据模型、脱敏与大小、
+事务错误映射、提交顺序、SSE final 门控、取消清理、连接生命周期和真实迁移。
 
 ```bash
 conda run -n opspilot pytest -v
 ```
 
-V0.1 基线 60 项，V0.2-M1 完成后、本次 M2 修改前基线 **98 passed**。M2 保留所有旧测试，当前总计 **172 项**：
+V0.1 基线 60 项，V0.2-M1 完成后、本次 M2 修改前基线 **98 passed**。M2 验收时保留所有旧测试，共 **172 项**：
 默认离线运行 **166 passed，6 skipped**；真实 Redis 集成测试单独启用后 **6 passed，0 failed**；启用真实 Redis 的完整运行 **172 passed，0 failed**。测试覆盖三个工具、注册表、完整多轮流程、观察值改变答案、并发隔离、
 请求校验、MAX_STEPS、未知工具、坏参数、工具异常/超时、模型异常/超时、取消传播、日志脱敏、
 真实适配器的请求协议及错误响应。
@@ -673,7 +889,7 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 - 所有运维数据都是 Mock，不能据此判断生产故障；MockLLM 的规划规则只用于演示。
 - 真实供应商仅做离线协议测试，未完成带真实 Key 的联调；专有 reasoning 续传等扩展不支持。
-- 已有可选短期 Redis 会话；没有身份认证、会话所有权校验、限流、长期故障记录、LLM token Streaming、总请求时间预算或全局并发控制。
+- 已有可选短期 Redis 会话；没有身份认证、会话所有权校验、限流、LLM token Streaming、总请求时间预算或全局并发控制。
 - 字符/字节及轮数上限不等于模型 token 预算；没有摘要、幂等提交或冲突结果合并，不应直接暴露到公网。
 - 有轮数与单次超时保护，但多工具请求仍可较慢；同一轮多个工具按顺序执行。
 - 模型输出只是建议，未实现全面的敏感内容检测；未来接入真实工具前需要输出脱敏和数据权限控制。
@@ -683,13 +899,14 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 ## Roadmap
 
-除已标注完成的 M1/M2 外，以下功能仍是规划。
+除已标注完成的 M1/M2/M3 外，以下功能仍是规划。
 
 ### V0.2
 
 - **M1 已完成**：SSE Agent 执行事件流。
 - **M2 已完成**：Redis Conversation Session。
-- M3：PostgreSQL Incident Persistence；Redis Cache 留待后续独立设计。
+- **M3 已完成**：PostgreSQL Incident Persistence。
+- M4：Redis Cache；后续独立设计，当前未实现。
 
 ### V0.3
 
@@ -703,8 +920,6 @@ RAG Runbook、MCP、Prometheus、Grafana、Agent Trace。
 
 pytest integration tests、k6 load testing、Mock LLM benchmark、performance tuning。
 
-M3 可在 `DiagnosisService` 增加独立 Incident Repository，按一次执行记录输入、最终结论、
-工具事件和失败状态，PostgreSQL Client 同样由 lifespan 管理。Conversation Session 继续只保存对话。
-需要单独定义记录 ID、事件脱敏、取消/失败状态和 Redis/PostgreSQL 双写一致性，不能假设跨存储自动原子提交。
-本次未提前实现 PostgreSQL 或 Redis Cache。
+M4 可复用内部 `IncidentRepository.get(id)`，但需独立设计认证、缓存键、TTL 与失效策略。
+本次未实现 Redis Cache，也未引入 XA、Saga、Outbox 或事件总线。
 先完成当前层的学习问答：[我作为 OpsPilot 作者必须能回答的问题](LEARNING.md)。

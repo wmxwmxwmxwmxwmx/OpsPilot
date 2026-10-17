@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.agent.loop import Agent
 from app.agent.schemas import AgentExecutionError
@@ -17,6 +19,9 @@ from app.api.health import router as health_router
 from app.api.sessions import router as sessions_router
 from app.core.config import Settings
 from app.core.logging import RequestLoggingMiddleware, configure_logging, log_event
+from app.db.session import create_database_engine
+from app.incident.errors import IncidentError
+from app.incident.repository import IncidentRepository
 from app.llm.base import BaseLLM
 from app.llm.mock import MockLLM
 from app.llm.openai_compatible import OpenAICompatibleLLM
@@ -50,7 +55,9 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                 tool_timeout_seconds=config.tool_timeout_seconds,
             )
             redis_client = None
+            engine = None
             application.state.sessions = None
+            application.state.incidents = None
             try:
                 if config.session_enabled:
                     # Lazy connection: Redis outages must not block stateless use.
@@ -67,15 +74,38 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                         secrets=(config.openai_api_key.get_secret_value(),
                                  unquote(urlsplit(redis_url).password or "")),
                     )
+                if config.incident_persistence_enabled:
+                    database_url = config.database_url.get_secret_value()
+                    engine = create_database_engine(database_url)
+                    application.state.incidents = IncidentRepository(
+                        async_sessionmaker(engine, expire_on_commit=False),
+                        secrets=(config.openai_api_key.get_secret_value(), database_url,
+                                 make_url(database_url).password or "",
+                                 config.redis_url.get_secret_value(),
+                                 unquote(urlsplit(config.redis_url.get_secret_value()).password or "")),
+                    )
                 yield
             finally:
-                if redis_client is not None:
-                    await redis_client.aclose()
+                try:
+                    if engine is not None:
+                        await engine.dispose()
+                finally:
+                    if redis_client is not None:
+                        await redis_client.aclose()
 
     application = FastAPI(title="OpsPilot", version="0.1.0", lifespan=lifespan)
     application.include_router(health_router)
     application.include_router(diagnose_router)
     application.include_router(sessions_router)
+
+    @application.exception_handler(IncidentError)
+    async def incident_error_handler(request: Request, error: IncidentError) -> JSONResponse:
+        content = {"code": error.code, "message": error.message,
+                   "session_committed": error.session_committed}
+        if error.incident_id is not None:
+            content["incident_id"] = str(error.incident_id)
+        status = 413 if error.code == "incident_too_large" else 503
+        return JSONResponse(status_code=status, content={"error": content})
 
     @application.exception_handler(SessionError)
     async def session_error_handler(request: Request, error: SessionError) -> JSONResponse:

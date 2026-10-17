@@ -17,7 +17,8 @@ logger = logging.getLogger("opspilot")
 # Only operational metadata can enter application logs. Never serialize requests,
 # provider bodies, headers, configuration objects, exception text or model output.
 ALLOWED_FIELDS = {"request_id", "method", "route", "status_code", "step", "tool",
-                  "latency_ms", "success", "code", "max_steps", "tool_call_count"}
+                  "latency_ms", "success", "code", "max_steps", "tool_call_count",
+                  "incident_id", "session_committed"}
 
 
 class JsonFormatter(logging.Formatter):
