@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.cache.keys import DEFAULT_KEY_PREFIX, validate_key_prefix
 from app.db.config import validate_database_url
 
 
@@ -28,9 +29,17 @@ class Settings(BaseSettings):
     session_max_bytes: int = Field(default=262144, ge=1024, le=1048576)
     incident_persistence_enabled: bool = False
     database_url: SecretStr = SecretStr("")
+    cache_enabled: bool = False
+    cache_ttl_seconds: int = Field(default=300, ge=1, le=604800)
+    cache_key_prefix: str = DEFAULT_KEY_PREFIX
+    cache_max_bytes: int = Field(default=65536, ge=1, le=1048576)
+    cache_io_timeout_seconds: float = Field(default=0.5, gt=0, le=10)
 
     @model_validator(mode="after")
     def validate_provider(self) -> Self:
+        validate_key_prefix(self.cache_key_prefix)
+        if self.cache_enabled and not self.incident_persistence_enabled:
+            raise ValueError("CACHE_ENABLED requires INCIDENT_PERSISTENCE_ENABLED")
         if self.incident_persistence_enabled:
             validate_database_url(self.database_url.get_secret_value())
         try:

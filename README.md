@@ -2,7 +2,7 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-当前版本 **V0.2-M3（PostgreSQL Incident Persistence）**，保留 M1 SSE、M2 Redis Session，新增可选的持久化诊断记录。
+当前版本 **V0.2-M4（Redis Cache）**，保留 M1 SSE、M2 Redis Session、M3 PostgreSQL 持久化，新增历史安全摘要的 Cache-Aside 查询。
 这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
@@ -16,6 +16,7 @@
 - 支持普通 JSON 诊断和 POST SSE 诊断，两者复用同一套 Agent 执行逻辑。
 - 可选 Redis Session：完整对话轮次、滑动 TTL、版本并发控制、提交成功后返回最终答案。
 - 可选 PostgreSQL Incident：脱敏问答、受限 JSONB 摘要、独立迁移与短事务；支持无状态/有状态诊断。
+- 可选 Redis Cache：历史 Incident 安全摘要、Cache-Aside、有限 TTL、主动失效和故障回源；提供本地查询 CLI。
 - `steps` 仅包含实际 Tool Call / Tool Result，不返回隐藏推理或中间模型文字。
 
 ## 架构与目录
@@ -25,6 +26,9 @@ Client → FastAPI → DiagnosisService
                     ├── SessionRepository → Redis（可选，短期对话）
                     ├── Agent → LLM / Tools
                     └── IncidentRepository → PostgreSQL（可选，长期记录）
+内部查询 / 本地 CLI → IncidentQueryService
+                    ├── CacheRepository → Redis（可选，可重建摘要）
+                    └── IncidentRepository → PostgreSQL（权威数据源）
 ```
 
 Agent 内部循环：
@@ -62,7 +66,9 @@ app/
 ├── api/                    # /health、/api/v1/diagnose、/api/v1/diagnose/stream、sse.py
 ├── agent/                  # loop.py、events.py、schemas.py、prompts.py
 ├── session/               # 对话 Schema、Redis Repository、安全错误和存储脱敏
-├── services/              # DiagnosisService 协调执行与双存储提交
+├── services/              # DiagnosisService 提交；IncidentQueryService Cache-Aside 查询
+├── cache/                 # 安全摘要 Schema、集中 Key、异步 Redis 缓存
+├── cli/                   # 本地历史摘要查询命令
 ├── db/                    # SQLAlchemy ORM、异步连接工厂、独立迁移配置
 ├── incident/              # 持久化业务 Schema、白名单摘要与 Repository
 ├── llm/                    # base.py、mock.py、openai_compatible.py
@@ -831,10 +837,212 @@ unset OPSPILOT_TEST_POSTGRES_URL OPSPILOT_TEST_REDIS_URL
 CLI `current → downgrade base → upgrade head → current`、提交成功后丢失确认的故障注入，
 以及 Redis 会话过期后 PG 记录仍可读取。离线单元测试禁止 asyncpg 建立真实连接。
 
+## V0.2-M4：Redis Cache-Aside 历史摘要查询
+
+M4 缓存的是**已经完成、业务上不可变的 Incident 安全摘要**。它不缓存用户问题、完整答案、
+Session 历史、工具 Observation、实时指标或实时诊断结论，也不会按自然语言问题复用 Agent 答案。
+每次 `/diagnose` 和 `/diagnose/stream` 仍独立执行原有 Agent，并遵循 M3 的提交顺序。
+
+### 业务入口与数据范围
+
+[`IncidentQueryService.get_summary(id)`](app/services/incident_query.py) 是实际的历史读取入口，
+由 [`main.lifespan`](app/main.py) 装配为 `app.state.incident_queries`，使用现有
+`IncidentRepository.get(id)` 回源。它没有增加公开 GET API；尚未建立身份认证与所有权校验，
+UUID 或缓存命名空间均不能替代访问授权。
+
+本地运维命令使用同一个应用装配和 Service，只读取已存在的诊断摘要：
+
+```bash
+# 修改 pyproject.toml 后重新安装以注册 CLI；无需新依赖。
+conda run -n opspilot pip install -e ".[dev]"
+# 先配置 .env 中 DATABASE_URL / REDIS_URL，并迁移、执行一次诊断获得 incident_id。
+incident_id='550e8400-e29b-41d4-a716-446655440000'  # 替换为诊断响应中的实际 UUID4
+conda run -n opspilot python -m app.cli.incident_summary "$incident_id"
+# 等价的已安装命令；第二次读取在 TTL 内命中：
+conda run -n opspilot opspilot-incident-summary "$incident_id"
+# 只删除这一条摘要的缓存，确认删除后再查询：
+conda run -n opspilot opspilot-incident-summary "$incident_id" --invalidate
+```
+
+CLI 输出安全运行日志和摘要 JSON，不运行 Agent、不创建 Incident、不执行迁移。
+退出码 0 表示找到，3 表示记录不存在，2 表示持久化未开启或参数不合法，1 表示查询失败或
+主动失效未获确认。失效失败时 CLI 不声称已读取最新数据，可关闭 CACHE_ENABLED 后再查询权威库。
+内部调用示例（在已有应用 lifespan 内）：
+
+```python
+summary = await app.state.incident_queries.get_summary(incident_id)
+acknowledged = await app.state.incident_queries.invalidate(incident_id)
+```
+
+严格的 [`IncidentSummary`](app/cache/schemas.py) 显式从 M3 模型抽取以下字段，拒绝额外字段：
+
+```json
+{
+  "schema_version": 1,
+  "incident_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "completed",
+  "tool_count": 2,
+  "tool_names": ["get_system_metrics", "get_mysql_slow_queries"],
+  "truncated": false,
+  "duration_ms": 1530,
+  "created_at": "2026-10-17T02:00:00Z",
+  "data_source": "mock_tools"
+}
+```
+
+`tool_names` 保留 M3 前 64 次调用的顺序和重复名称，不代表去重工具集合；`tool_count` 是总次数，
+`truncated` 表示摘要是否截断。工具名沿用 M3 白名单，时间必须 UTC，schema_version 必须明确为整数 1。
+`data_source=mock_tools` 表明当前 Tools 都是模拟数据，即使配置真实 LLM 也不能将其视为生产证据。
+
+### Cache Key、TTL 与配置
+
+Key 的唯一构造位置是 [`incident_summary_key`](app/cache/keys.py)：
+
+```text
+opspilot:cache:incident_summary:v1:{UUID4}
+```
+
+它包含项目、缓存命名空间、数据种类、Schema 版本和服务器生成的业务 ID，不包含用户原文。
+Prefix 必须为 `opspilot:cache` 或其冒号分隔的安全子命名空间，整体最长 128 字符；
+子段只允许字母、数字、下划线和短横线。不能配置为 `opspilot:session`，不接受通配符。
+不兼容的摘要升级需要同时更换 Key 的 v1 与模型版本，并让旧 Key 按 TTL 自然回收。
+
+| 配置 | 默认值 | 约束与含义 |
+|---|---|---|
+| `CACHE_ENABLED` | false | 开启必须同时开启 INCIDENT_PERSISTENCE_ENABLED，保留权威数据源 |
+| `CACHE_TTL_SECONDS` | 300 | 1–604800 秒，所有写入用 SET EX |
+| `CACHE_KEY_PREFIX` | opspilot:cache | 受限缓存命名空间，可加测试/环境子段 |
+| `CACHE_MAX_BYTES` | 65536 | 1–1048576，UTF-8 JSON 读写上限 |
+| `CACHE_IO_TIMEOUT_SECONDS` | 0.5 | 每次缓存 IO 的整体 deadline，范围大于 0 且不超过 10 秒 |
+| `REDIS_URL` | 既有 Redis 配置 | Cache 与 Session 使用同一 URL，不重复配置连接池 |
+
+```dotenv
+INCIDENT_PERSISTENCE_ENABLED=true
+CACHE_ENABLED=true
+CACHE_TTL_SECONDS=300
+CACHE_KEY_PREFIX=opspilot:cache
+CACHE_MAX_BYTES=65536
+CACHE_IO_TIMEOUT_SECONDS=0.5
+```
+
+Cache 关闭时，已装配的 QueryService 直接查询 PostgreSQL；不创建缓存客户端或执行缓存 IO。
+`SESSION_ENABLED=false` 不阻止 Cache 工作。两者都启用时共享一个应用级异步 Redis Client/Pool，
+同一客户端只关闭一次；无论请求数量多少，都不按请求新建客户端。
+共享连接/命令 socket timeout 仍为 M2 的 2 秒、禁用自动重试，Cache 额外施加较短的操作 deadline。
+该 deadline 不是整个业务请求超时；损坏数据可能依次执行 GET、DEL、SET，每次分别限时。
+
+Session TTL 控制不可自动重建的对话状态生命周期，并在成功提交时滑动刷新；Cache TTL 控制
+可从 PostgreSQL 重建的副本，普通 GET 不刷新。当前摘要不可变，TTL 主要用于内存回收及版本更新。
+[Redis SET EX](https://redis.io/docs/latest/commands/set/) 在同一命令中写入值和有效期，避免 SET 后
+再单独 EXPIRE 之间出现无 TTL 窗口；[普通读取不延长有效期](https://redis.io/docs/latest/commands/expire/)。
+
+### Cache-Aside 调用链
+
+```mermaid
+flowchart TD
+    Q[内部业务 / 本地 CLI] --> S[IncidentQueryService.get_summary]
+    S --> C{Cache 是否开启}
+    C -->|否| P[IncidentRepository.get → PostgreSQL SELECT]
+    C -->|是| G[CacheRepository.get → Redis GET]
+    G -->|合法 Hit| R[返回安全摘要]
+    G -->|Miss / Redis 错误| P
+    G -->|坏 JSON / 版本或 ID 不符 / 超长| D[尝试 DEL 错误 Key]
+    D --> P
+    P -->|数据库错误| E[原业务异常继续传播]
+    P -->|记录不存在| N[返回 None，不缓存空值]
+    P -->|找到| W[白名单构建 IncidentSummary]
+    W --> F[开启缓存时 SET EX；失败记录日志]
+    F --> R
+```
+
+[`CacheRepository`](app/cache/repository.py) 只负责 Redis GET/SET EX/DEL、序列化、校验、大小、TTL
+和缓存故障日志；不知道 PostgreSQL、Agent 或 SSE。读取检查缓存 ID 与请求 ID 一致，防止串记录。
+缓存损坏时尝试删除指定 Key，即使 DEL 失败仍回源；成功回填会覆盖坏值。不缓存 None 或数据库异常。
+
+QueryService 的 PostgreSQL 调用不在缓存异常捕获块中，数据库失败不会被伪装成 None 或缓存成功。
+缓存只捕获预期 RedisError、操作超时和明确的数据校验错误；编程错误仍传播，CancelledError
+不会转为 Cache Miss。GET 取消不继续回源，SET 取消不会把取消请求当作成功返回。
+
+### Invalidation、Stale Data 与一致性边界
+
+M3 没有生产 UPDATE/DELETE 业务方法，记录创建后不可变，因此 M4 没有为演示强行增加更新 API。
+内部 `invalidate(id)` 用单个 DEL，仅删除指定缓存 Key；返回 true 表示已收到删除确认（包括 Key
+原本不存在），false 表示未获确认，不保证旧 Key 已消失。它从不扫描/删除 Session Key，也不用 FLUSHDB/FLUSHALL。
+
+未来如果增加可变记录，基本顺序应为 `PostgreSQL COMMIT 成功 → DEL Cache`。COMMIT 失败不能报告
+更新成功；DEL 失败则记录错误，并承认旧值可能保留。两者不是一个原子事务。
+过期是 TTL 结束；陈旧是缓存值已经落后于权威库，可能仍有正 TTL。TTL 不保证强一致性。
+
+即使提交后删除，也可能发生：A Miss 并读到旧值 → B 提交新值并 DEL → A 把旧值 SET 回去。
+[`test_stale_fill_race_is_explicitly_not_strong_consistency`](tests/test_cache.py) 用事件同步复现该顺序。
+真实集成测试还在独立测试数据库里受控 UPDATE 耗时，验证未失效时读旧摘要，COMMIT 后失效才回源新值。
+生产业务暂不允许这类修改；未来需要版本比较、更新序列、可靠失效通知或特定一致性协议。
+运维直接 SQL 修正或删除记录也在不可变契约之外，必须考虑失效和并发在途回填，不能仅凭 DEL 承诺最新读取。
+
+缓存结果不参与 Session version 校验、事务提交、Agent 执行许可或实时诊断决策。
+PG 暂时不可用时，合法缓存 Hit 仍可返回历史摘要；Miss 则必须报告 PG 错误。
+
+### 故障降级与可观测性
+
+| 失败 | Cache 查询行为 | 与 Session 的区别 |
+|---|---|---|
+| Redis GET 失败/超时 | 记录 cache_error，回源 PostgreSQL | Session 读取失败仍返回 SessionError |
+| Redis SET 失败/超时 | 返回已经查到的 PG 摘要 | Session commit 失败不能假装成功 |
+| Redis DEL 失败/超时 | 返回 false，记录失效未确认 | 不修改已有 Session WATCH/MULTI/EXEC |
+| 内容损坏/版本不符/超限 | 尝试删除后回源 | 不把损坏数据交给调用方 |
+| PG 查询失败 | 原异常传播，不填充缓存 | PG 仍是权威来源 |
+| 客户端取消 | 传播取消，停止后续步骤 | 不在后台重试或补写 |
+
+日志事件包括 `cache_hit`、`cache_miss`、`cache_set`、`cache_invalidate`、`cache_error`、`cache_fallback`。
+只记录缓存种类、操作、耗时和固定错误码；不记录 Key/Prefix、凭据、连接字符串、问答或原始工具数据。
+这里的 fallback 表示本次去 PostgreSQL 查询，普通 Miss 和缓存故障均可能触发。
+没有新增 Prometheus、自动重试、分布式锁、Lua 或后台刷新任务。
+
+### 并发与实际验收
+
+并发 Miss 可以重复回源；每个 PostgreSQL 操作仍独立创建 AsyncSession。Redis 每次 SET EX 原子写入
+完整 JSON，因此不会形成半条缓存。真实测试同步两个 Miss，实际观察到 **2 次 SELECT**，随后值完整且带 TTL。
+这不是 Singleflight：热点 Key 过期仍有击穿/Stampede 风险，不存在 ID 的重复查询仍有穿透风险，
+大量 Key 同时过期或 Redis 故障仍可能造成雪崩和数据库压力。未来按实际流量评估合并请求、有限锁、
+TTL 抖动、短期空值缓存、限流和数据库容量，不提前引入复杂协调。
+
+本次使用已有临时运行文件，在新的 `/tmp` 数据目录启动 PostgreSQL 18.6 / Redis 8.0.5，
+没有安装系统组件或操作已有数据库。测试复用 [`postgres_support.py`](tests/postgres_support.py)
+中的 M3 随机数据库 fixture；Redis Cache 使用随机 `opspilot:cache:m4:<uuid>` 前缀，只删除自己登记的 Key。
+
+| 查询步骤 | 实际 Incident SELECT 增量 |
+|---|---:|
+| 首次 Cache Miss | 1 |
+| 第二次 Cache Hit | 0 |
+| 主动 invalidate 后读取 | 1 |
+| 强制 TTL 到期后读取 | 1 |
+
+SQL 数字来自 [`test_cache_integration.py`](tests/test_cache_integration.py) 中 SQLAlchemy 的实际
+`before_cursor_execute` 计数，不是根据返回结果相同推断。没有做延迟性能基准，不声称某个百分比提速。
+真实测试也覆盖 CLI 两次读取、无 Session 的 Cache、有 Session 的共享客户端、缓存失效不影响 Session、
+Redis 真实连接拒绝回退，以及同一问题依然执行两次完整 Agent。
+
+```bash
+# 需先准备隔离服务及名为 opspilot_test* 的 bootstrap DB，账号具有 CREATEDB。
+export OPSPILOT_TEST_POSTGRES_URL='postgresql+asyncpg://test_user:password@127.0.0.1:15432/opspilot_test'
+export OPSPILOT_TEST_REDIS_URL='redis://127.0.0.1:16379/0'
+conda run -n opspilot pytest -q tests/test_cache_integration.py
+conda run -n opspilot pytest -q
+unset OPSPILOT_TEST_POSTGRES_URL OPSPILOT_TEST_REDIS_URL
+# 默认离线回归：
+conda run -n opspilot pytest -q
+```
+
+M4 前基线：242 项，默认 **217 passed、25 skipped**。M4 新增 **83 项离线测试、11 项双存储集成测试**。
+完成后默认 **300 passed、36 skipped**；显式启用两个数据库后 **336 passed、0 failed、0 skipped**。
+按标记统计真实 Redis **18 项**、PostgreSQL **30 项**，其中 **12 项同时使用两者**，不能将这两个数字直接相加。
+默认跳过的 36 项仅因未配置集成环境；完整验收没有未执行测试。
+验收后已确认随机测试数据库和 Redis 测试 Key 清理完成，并停止本次临时实例；没有提交或推送 Git。
+
 ## Tests
 
 M3 开发前在项目 Conda Python 3.11 中实际运行的基线是 **166 passed、6 skipped**。
-M3 验收结果：启用隔离 PostgreSQL 与 Redis 后 **242 passed、0 skipped、0 failed**；
+M3 历史验收结果：启用隔离 PostgreSQL 与 Redis 后 **242 passed、0 skipped、0 failed**；
 默认离线 **217 passed、25 skipped、0 failed**（25 项需显式数据库配置）。原有测试全部保留，未放宽断言。
 新增 `test_incidents.py` 与 `test_postgres_integration.py` 覆盖数据模型、脱敏与大小、
 事务错误映射、提交顺序、SSE final 门控、取消清理、连接生命周期和真实迁移。
@@ -896,17 +1104,18 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
   当前 steps 中只有固定 Mock Data；有效工具参数及输出将来若含 Secret，必须在工具边界显式处理。
 - 依赖使用兼容版本范围，尚无锁文件或自动更新策略；Docker 镜像也未固定 digest。
 - 没有重试退避、费用统计或生产监控，日志为最低限度的运行元数据。
+- 历史摘要缓存没有 Singleflight、负缓存、TTL 抖动、可靠失效或命中率聚合监控；首次 Miss 仍读取完整 Incident 后再投影。
 
 ## Roadmap
 
-除已标注完成的 M1/M2/M3 外，以下功能仍是规划。
+除已标注完成的 M1/M2/M3/M4 外，以下功能仍是规划。
 
 ### V0.2
 
 - **M1 已完成**：SSE Agent 执行事件流。
 - **M2 已完成**：Redis Conversation Session。
 - **M3 已完成**：PostgreSQL Incident Persistence。
-- M4：Redis Cache；后续独立设计，当前未实现。
+- **M4 已完成**：Redis Cache-Aside 历史安全摘要，TTL、主动失效、故障降级、内部查询与本地 CLI。
 
 ### V0.3
 
@@ -920,6 +1129,6 @@ RAG Runbook、MCP、Prometheus、Grafana、Agent Trace。
 
 pytest integration tests、k6 load testing、Mock LLM benchmark、performance tuning。
 
-M4 可复用内部 `IncidentRepository.get(id)`，但需独立设计认证、缓存键、TTL 与失效策略。
-本次未实现 Redis Cache，也未引入 XA、Saga、Outbox 或事件总线。
+M4 已复用内部 `IncidentRepository.get(id)`；认证、租户授权、缓存击穿保护和可靠失效仍需后续设计。
+当前未引入 XA、Saga、Outbox 或事件总线。
 先完成当前层的学习问答：[我作为 OpsPilot 作者必须能回答的问题](LEARNING.md)。

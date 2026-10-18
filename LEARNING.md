@@ -287,3 +287,178 @@ SSE 取消也不承诺已经提交的数据回滚，final 缺失不能证明数�
 参考：[SQLAlchemy 异步文档](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html)、
 [Alembic 异步迁移](https://alembic.sqlalchemy.org/en/latest/cookbook.html#using-asyncio-with-alembic)、
 [PostgreSQL JSON 类型](https://www.postgresql.org/docs/current/datatype-json.html)。
+
+## V0.2-M4：历史 Incident 摘要的 Redis Cache-Aside
+
+学习入口是 [`IncidentQueryService`](app/services/incident_query.py)，缓存实现是
+[`CacheRepository`](app/cache/repository.py)，本地命令是 [`incident_summary.py`](app/cli/incident_summary.py)。
+M4 只缓存不可变的 completed 历史摘要；它不参与 Agent 实时执行或 M2/M3 的成功提交判断。
+
+### 1. 什么是 Cache-Aside？
+
+调用方显式协调缓存和权威库，而不是让数据库自动管理缓存。`get_summary()` 先 await cache.get，
+未命中才 await incidents.get，再构造 `IncidentSummary` 并 await cache.set。
+缓存关闭时直接回源；数据库没有记录就返回 None，不保存空值或异常。
+缓存模块不认识 PostgreSQL，IncidentRepository 也不认识 Redis，编排集中在 QueryService。
+
+### 2. Cache Hit 和 Cache Miss 是什么意思？
+
+Hit 是 Redis 有值，并且摘要的 JSON、Schema 版本、UUID、字段类型和字节数都校验成功。
+Miss 是 Key 不存在。损坏值不是合法 Hit，会记录 cache_data_error、尝试删除并回源；
+Redis 故障也回源，但单独记录 cache_error，避免把所有失效原因混为一种。
+[`test_cache_aside_miss_hit_invalidate_reduces_queries`](tests/test_cache.py) 的源 Repository 调用增量为 1、0、1。
+
+### 3. 为什么先查 Redis，再查 PostgreSQL？
+
+同一历史摘要重复读取时，Hit 可以减少 PostgreSQL SELECT 和连接池占用。
+若先查 PostgreSQL 再检查 Redis，已经支付了数据库查询成本，不是本项目要验证的优化。
+代价是 Miss 多出一次 Redis GET 和一次回填 SET；低命中率场景可能更慢，因此默认不开启，
+本次只证明查询次数减少，没有宣称某个百分比的端到端提速。
+
+### 4. 为什么 PostgreSQL 是权威存储？
+
+Incident 在 M3 的 PostgreSQL 事务中创建，Cache 值则是按白名单派生的可重建副本。
+删除所有本项目缓存不会删除 Incident，下一次 Miss 能回源重建。
+`CACHE_ENABLED=true` 要求 `INCIDENT_PERSISTENCE_ENABLED=true`，避免装配出只有缓存、没有源库的查询入口。
+权威性不等于每次读取都会验证最新值：Hit 可直接返回历史摘要，即使这时 PG 不可用。
+
+### 5. Cache 和 Session 的 Redis 数据有什么区别？
+
+[`SessionRepository`](app/session/repository.py) 保存用于下一轮 Agent 的对话，是业务状态；
+丢失后不能简单从 Incident 恢复原有版本、完整历史与 TTL。
+Cache 只保存可从 PG 派生的历史元数据，GET/SET 故障允许降级；
+Session commit 仍必须 WATCH/MULTI/EXEC 成功，不能借用 Cache 的“写失败也继续成功”语义。
+两者使用不同命名空间，可以共享连接池，但不共享事务与数据模型。
+
+### 6. Redis SET EX 的作用是什么？
+
+`CacheRepository.set()` 使用 `await client.set(key, payload, ex=ttl_seconds)`。
+一条 Redis 命令同时写入完整 JSON 并设置过期时间，不会出现先 SET 成功、EXPIRE 失败而永久驻留的窗口。
+普通 get 不续期。真实测试先把剩余 TTL 降到 10 秒，读取后仍不超过 10 秒，随后用服务端过期命令
+使 Key 到期，再断言下一次查询重新 SELECT。参考 [Redis SET](https://redis.io/docs/latest/commands/set/)。
+
+### 7. Cache Key 应该如何设计？
+
+[`incident_summary_key`](app/cache/keys.py) 集中构造
+`opspilot:cache:incident_summary:v1:{UUID4}`。UUID 来自服务器生成的 Incident ID，不接收任意用户问题作为 Key。
+配置 prefix 只能位于 opspilot:cache 下，安全子段支持测试环境隔离；它不能变成 Session 前缀。
+Key 是寻址规则，不能证明谁有权读取，也不是租户认证机制。
+
+### 8. 为什么 Key 要有版本号？
+
+不同摘要结构不能在同一 Key 上混读。未来增加不兼容结构时，修改 Key 前缀 v1 和 payload 中的版本，
+新读者使用新 Key，旧 Key 由 TTL 回收。当前 `schema_version` 必须显式存在且为整数 1，
+缺失、字符串、布尔值或其他版本均会被视为坏数据；不能让默认值掩盖缺版本的旧格式。
+
+### 9. TTL 到期与 Stale Data 有什么区别？
+
+到期表示副本不再存在；陈旧表示它仍存在但不再等于权威数据。两者不是同一件事。
+真实测试在专用 PG 数据库更新 duration_ms 后，Redis 仍有正 TTL，读取却返回旧耗时。
+当前业务不更新已完成 Incident，所以 TTL 主要控制内存和结构更新；如果将来支持修正/删除，
+就必须额外管理陈旧窗口。有限 TTL 只是限制通常的保留时间，不能作为强一致性保证。
+
+### 10. 什么是 Cache Invalidation？
+
+主动使副本失效，让下一次读取重新回源。`IncidentQueryService.invalidate(id)` 委托 CacheRepository
+执行单 Key DEL。返回 true 表示收到删除确认，原本不存在也算成功；false 表示未确认。
+它不删除数据库、不删除 Session，也不使用通配删除或 FLUSHDB/FLUSHALL。
+M3 没有业务 UPDATE，所以本阶段提供内部方法和测试，不添加人为的更新 API。
+
+### 11. 为什么更新数据库后通常删除缓存，而不是直接更新缓存？
+
+直接更新会让写路径承担摘要构建和双写顺序，两个并发写者还可能把旧摘要最后写入缓存。
+删除把副本重建统一交给读取路径，逻辑通常更简单。不过删除也不是万能一致性机制，
+必须继续分析并发回填、DEL 失败和访问频率。M4 的实际写路径仍只是 M3 INSERT，未加新的业务更新。
+
+### 12. 为什么先更新数据库，再删除缓存？
+
+如果先删缓存再提交数据库，另一个读者可能在提交前读到旧值并重新缓存，即使事务最后成功也会留下旧副本。
+因此未来写者应在 PG COMMIT 确认后调用 invalidate；COMMIT 失败就不能声称更新成功。
+真实测试里的受控 SQL UPDATE 在 `async with engine.begin()` 退出后才失效。
+Redis DEL 不属于 PG 事务，两者无法一起 rollback。
+
+### 13. 提交后删除是否完全避免旧数据？
+
+不能。测试 [`test_stale_fill_race_is_explicitly_not_strong_consistency`](tests/test_cache.py) 使用事件同步：
+A Miss 并持有旧快照 → B 提交新值 → B DEL → A SET 旧快照 → 后续 Hit 读旧值。
+M4 用“只缓存业务不可变的 completed 记录”缩小这一风险，没有假装修复竞态。
+未来若允许变化，需要版本化记录、CAS/更新序列或可靠通知等方案，并分析删除与回填的完整协议；
+对必须最新的读取应绕过缓存。一次 DEL 也不能保证删除前已开始的读取不会再次回填。
+
+### 14. 什么是缓存穿透？
+
+大量查询不存在的 ID，Redis 总是 Miss，PG 也总返回 None。M4 默认不做负缓存，所以同一缺失 ID
+查询两次产生两次 SELECT，测试明确验证此行为。未来可考虑短 TTL 空值缓存、鉴权/限流或 Bloom Filter，
+但负缓存又需要处理后来创建的数据何时变得可见，不能无条件加入。
+
+### 15. 什么是缓存击穿？
+
+一个热门 Key 过期，许多请求一起 Miss 并回源，瞬间集中打到数据库。
+M4 不加锁，两个并发 Miss 真实产生两次 SELECT。这里所有结果都是同一不可变摘要，SET EX 仍完整写入，
+所以正确性不受重复回源影响，但容量可能受影响。流量足够大时才考虑 Singleflight 或短生命周期锁。
+
+### 16. 什么是缓存雪崩？
+
+很多 Key 同时过期，或者 Redis 故障导致大面积 fallback，回源总量突然上升。
+本项目固定 TTL 且没有抖动；缓存可降级不代表数据库有无限承载能力。
+生产需要容量规划、TTL 抖动、流量限制和降级监控。本次没有修改全局 Redis 策略或引入大型监控组件。
+
+### 17. 什么是 Cache Stampede？
+
+它描述并发请求争相重建缓存，热点失效时常与击穿一起出现。
+本进程 Singleflight 可把同一 Key 的回源合并为一个任务，但要处理取消、异常与等待者生命周期；
+多进程还需要讨论分布式协调。分布式锁有租约、持有者失败和锁释放等额外问题。
+对本阶段简单历史摘要，明确重复查询的边界比引入 Redlock 或复杂 Lua 更合适。
+
+### 18. 为什么缓存故障可以回退数据库？
+
+缓存是可丢弃的优化层。GET 异常/超时返回未命中并记录错误；SET 失败仍返回已查到的权威摘要；
+DEL 失败返回 false，不声称失效完成。每次缓存 IO 有独立 `asyncio.timeout`，共享 Redis Client 禁用自动重试。
+只捕获预期 RedisError/超时及数据校验错误，不捕获任意 Exception；CancelledError 必须继续传播。
+测试覆盖真实 TCP 连接拒绝、Redis GET/SET/DEL 异常、操作 deadline 和外部取消。
+
+### 19. 为什么 Session 更新失败不能相同降级？
+
+Session 更新属于接受一轮完整 User/Assistant 对话的业务承诺。未确认 commit 就返回 final，
+下一轮可能读不到刚才的历史，或覆盖另一个请求已提交的版本。
+M4 的 Redis 客户端复用只涉及连接资源，SessionRepository 的异常与 WATCH 语义完全保留。
+[`test_cache_outage_does_not_change_session_commit_errors`](tests/test_cache.py) 同时验证：摘要能回源，Session 仍报错。
+
+### 20. 为什么不能直接缓存实时 Agent 答案？
+
+自然语言问题相同，并不说明服务器、时间窗口、会话、权限或指标相同。
+复用旧答案会跳过当前采集并把历史证据误认为实时状态。M4 的 Key 只接受一个已完成 Incident 的 ID，
+查询服务不用于选择工具或允许诊断。真实测试对同一问题分别调用 JSON 和 SSE，仍执行六次 LLM 调用，
+即两个独立的三轮 Mock Agent，而不是命中一次旧答案。
+
+### 21. 如何证明缓存减少数据库查询？
+
+离线测试用 AsyncMock 的 get.await_count，真实测试在 Engine 上监听 before_cursor_execute，
+只统计涉及 incident_records 的 SELECT。首次 Miss=1，第二次 Hit=0，主动失效后=1，TTL 到期后=1。
+这证明避免了查询，不证明一定降低端到端延迟：序列化、Redis 网络往返、Miss 回填也有成本。
+本次没有延迟百分比或吞吐提升的结论。测试不是仅比较两次结果内容相同。
+
+### 22. 哪些场景缓存反而增加复杂度？
+
+低复用率、源查询已经便宜、数据频繁变化、严格要求最新值或授权规则复杂时，缓存可能增加额外延迟、
+副本一致性、失效、故障和权限成本。本项目因此默认 CACHE_ENABLED=false，仅投影稳定安全字段。
+首次 Miss 当前仍由 M3 get 读取完整记录再投影；未来可根据真实查询分析决定是否增加数据库侧只选摘要字段的读取。
+共享 Session/Cache 连接池也存在资源竞争，若流量需要隔离，应再引入独立配置和各自生命周期。
+
+### 完整 V0.2 的分工
+
+| 里程碑 | 负责的事 | 一致性要求 |
+|---|---|---|
+| M1 SSE | 执行事件流、取消、编码 | 工具事件即时发送，终态不能提前确认 |
+| M2 Redis Session | 短期上下文 | WATCH/version 防丢更新，提交失败明确报错 |
+| M3 PostgreSQL | 长期诊断记录 | 短事务、约束、回滚；双存储部分成功/未知明确报告 |
+| M4 Redis Cache | 历史安全摘要副本 | 可重建、可降级；TTL/失效不等于强一致 |
+
+`DiagnosisService` 承担执行与提交；`IncidentQueryService` 承担历史查询。两条链共享 Repository/Client
+等资源，但缓存 Hit 不代替执行、不参与事务判断。所有真实数据库网络 IO 都异步；Cache/PG 调用顺序执行，
+没有跨 Redis 与 PostgreSQL 的共同事务。
+
+练习：运行本地 CLI 两次，观察 cache_miss/cache_fallback/cache_set 与 cache_hit 的日志差别。
+练习：关闭 CACHE_ENABLED 再读同一 ID，解释为什么仍能读取、却每次都要 SELECT。
+练习：阅读旧值回填测试，说明为什么简单加一个更长或更短的 TTL 都不能使其变成强一致。
+练习：解释为什么两个并发 Miss 的结果正确，并不代表已经解决 Stampede。

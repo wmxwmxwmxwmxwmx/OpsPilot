@@ -17,6 +17,7 @@ from app.agent.schemas import AgentExecutionError
 from app.api.diagnose import router as diagnose_router
 from app.api.health import router as health_router
 from app.api.sessions import router as sessions_router
+from app.cache.repository import CacheRepository
 from app.core.config import Settings
 from app.core.logging import RequestLoggingMiddleware, configure_logging, log_event
 from app.db.session import create_database_engine
@@ -27,6 +28,7 @@ from app.llm.mock import MockLLM
 from app.llm.openai_compatible import OpenAICompatibleLLM
 from app.session.errors import SessionError
 from app.session.repository import SessionRepository
+from app.services.incident_query import IncidentQueryService
 from app.tools.mysql_diagnostics import MySQLDiagnosticsTool
 from app.tools.redis_diagnostics import RedisDiagnosticsTool
 from app.tools.registry import ToolRegistry
@@ -58,14 +60,17 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
             engine = None
             application.state.sessions = None
             application.state.incidents = None
+            application.state.incident_cache = None
+            application.state.incident_queries = None
             try:
-                if config.session_enabled:
-                    # Lazy connection: Redis outages must not block stateless use.
+                if config.session_enabled or config.cache_enabled:
+                    # One lazy application client/pool for the same Redis URL.
                     redis_url = config.redis_url.get_secret_value()
                     redis_client = Redis.from_url(
                         redis_url, decode_responses=False, socket_connect_timeout=2,
                         socket_timeout=2, max_connections=20, retry=Retry(NoBackoff(), 0),
                     )
+                if config.session_enabled:
                     application.state.sessions = SessionRepository(
                         redis_client, ttl_seconds=config.session_ttl_seconds,
                         max_turns=config.session_max_turns,
@@ -83,6 +88,16 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                                  make_url(database_url).password or "",
                                  config.redis_url.get_secret_value(),
                                  unquote(urlsplit(config.redis_url.get_secret_value()).password or "")),
+                    )
+                if config.cache_enabled:
+                    application.state.incident_cache = CacheRepository(
+                        redis_client, ttl_seconds=config.cache_ttl_seconds,
+                        key_prefix=config.cache_key_prefix, max_bytes=config.cache_max_bytes,
+                        io_timeout_seconds=config.cache_io_timeout_seconds,
+                    )
+                if application.state.incidents is not None:
+                    application.state.incident_queries = IncidentQueryService(
+                        application.state.incidents, application.state.incident_cache,
                     )
                 yield
             finally:

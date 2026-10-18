@@ -7,6 +7,7 @@ from redis.asyncio.connection import Connection
 
 from app.core.config import Settings
 from app.main import create_app
+from postgres_support import database  # noqa: F401 -- shared pytest fixture
 
 
 @pytest.fixture(autouse=True)

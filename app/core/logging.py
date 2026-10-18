@@ -18,7 +18,7 @@ logger = logging.getLogger("opspilot")
 # provider bodies, headers, configuration objects, exception text or model output.
 ALLOWED_FIELDS = {"request_id", "method", "route", "status_code", "step", "tool",
                   "latency_ms", "success", "code", "max_steps", "tool_call_count",
-                  "incident_id", "session_committed"}
+                  "incident_id", "session_committed", "cache_type", "operation"}
 
 
 class JsonFormatter(logging.Formatter):
