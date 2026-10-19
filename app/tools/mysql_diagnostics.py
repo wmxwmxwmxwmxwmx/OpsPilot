@@ -4,6 +4,8 @@ from app.tools.registry import EmptyInput, Tool
 
 
 class MySQLDiagnosticsTool(Tool[EmptyInput]):
+    safety = "read_only"
+    checkpoint_fields = ("slow_queries",)
     name = "get_mysql_slow_queries"
     description = "获取模拟 MySQL 慢 SQL、耗时和扫描行数；全部为 Mock Data。"
     input_schema = EmptyInput

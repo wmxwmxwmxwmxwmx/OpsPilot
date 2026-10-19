@@ -462,3 +462,76 @@ M4 的 Redis 客户端复用只涉及连接资源，SessionRepository 的异常�
 练习：关闭 CACHE_ENABLED 再读同一 ID，解释为什么仍能读取、却每次都要 SELECT。
 练习：阅读旧值回填测试，说明为什么简单加一个更长或更短的 TTL 都不能使其变成强一致。
 练习：解释为什么两个并发 Miss 的结果正确，并不代表已经解决 Stampede。
+
+## V0.3：从一次协程执行到可恢复的工作流
+
+下表对应本次实际实现，`test_workflow_graph.py` 是快速离线验证，
+`test_workflow_postgres.py` 才证明跨连接、跨进程持久化；两者不能互相替代。
+
+| # | 问题 | 结合代码回答 |
+|---|---|---|
+| 1 | LangGraph 是什么？ | 本项目使用的状态图运行库；`build_graph` 定义节点/路由，编译后的 Graph 调度执行并写 Checkpoint。它不是另一个 LLM，也没有替换 BaseLLM。 |
+| 2 | 与手写 Agent Loop 的区别？ | `Agent.stream` 把执行进度保存在当前协程的消息列表中；Graph 将每次规划、单个工具、审批分别作为持久化边界。旧接口保持旧循环，新 API 使用图。 |
+| 3 | StateGraph、Node、Edge 是什么？ | `StateGraph(GraphState)` 指定共享状态形状；`WorkflowNodes.plan/execute_tool` 等是节点；`add_edge/add_conditional_edges` 决定下一个节点。见 [graph.py](app/workflow/graph.py)。 |
+| 4 | GraphState 如何更新？ | 节点返回局部 dict，框架合并；`checked_update` 在写前检查总尺寸。消息通过新列表替换，代码不就地修改 Checkpoint 读出的共享对象。见 [state.py](app/workflow/state.py)。 |
+| 5 | Reducer 有什么用？ | `tool_results: Annotated[..., merge_results]` 根据服务器 call_id 合并、替换重复结果，而不是简单相加；`test_reducer_deduplicates_and_limits_state` 验证幂等合并。 |
+| 6 | START / END 的作用？ | START 指向首次 plan；END 结束 Graph。END 不等于业务已提交，Service 之后还要处理 Session 与 Incident。 |
+| 7 | 条件分支如何实现？ | `after_plan` 根据是否已有答案去 finalize 或 validate；`after_validation` 看审批信息；`after_tool` 优先消费同轮剩余调用，否则回 plan。路由是 async，避免无意义的线程池跳转。 |
+| 8 | 什么是 Checkpoint？ | 某次图执行边界的状态、版本、待执行节点和 pending writes；`aget_state` 返回可恢复快照。它包含控制信息，不只是问答 JSON。 |
+| 9 | 与 Redis Session 的区别？ | Session 只保存有限的 user/assistant 成对历史和 TTL/version；Checkpoint 保存当前工具、审批和下一节点，生命周期独立，可在 Session 已过期后继续。 |
+| 10 | thread_id 的作用？ | Saver 查找执行历史的键。本项目等于服务器生成 workflow_id，每次执行新建；同一个 session_id 能有多个不同 thread。 |
+| 11 | 为什么 Checkpointer 要持久化？ | InMemorySaver 随进程退出丢失；`test_real_process_exit_then_approval_in_new_process` 用两个 Python 进程证明 PostgreSQL 审批中断可继续。 |
+| 12 | AsyncPostgresSaver 如何工作？ | 通过独立 psycopg pool 保存 checkpoint blobs/writes 等表；开启 autocommit/dict_row，显式 `setup()` 执行官方内部迁移。见 [checkpoint.py](app/workflow/checkpoint.py)。 |
+| 13 | 在什么边界保存？ | 本项目 `durability='sync'` 等待图步骤持久化后进入下一步；plan、validate、审批和每个 tool 分别有边界。当前正在执行而未确认的节点仍可能重跑。 |
+| 14 | Resume 与 Retry 的区别？ | RetryPolicy 在本次执行中重试瞬时错误；Resume 重新连接已有 thread，用 `None` 继续保存的待执行节点。它不会创建新 workflow 或重置初始输入。 |
+| 15 | Failed Task Resume 是什么？ | 第二个工具失败时，第一个已确认结果留在 Saver；修复后 resume 从 execute_tool 继续。`test_m3_failed_node_resume_no_reexecution` 把第一个工具替换为“若调用则失败”的断言来证明没有重跑。 |
+| 16 | 为什么某些节点重跑？ | 故障发生在节点内时没有完成 checkpoint；interrupt 恢复也从节点开头再进入。图不是 Python 指令指针的持久化，不能依赖局部变量从任意行继续。 |
+| 17 | 为什么不天然 exactly-once？ | 工具效果与 checkpoint 保存是两个提交；效果已产生、checkpoint 未写入时进程可能崩溃。图只知道这个节点尚未确认，因此会重试执行。 |
+| 18 | 什么是幂等性？ | 相同操作重发得到相同已确认效果。本项目 mock action 的唯一 operation_id 使重复 INSERT 返回原结果；不是靠内存计数器。 |
+| 19 | 幂等键如何设计？ | SHA256(workflow_id、服务器 call_id、工具名称、规范化参数)。同一次调用恢复键相同，不同 workflow/调用/参数键不同。键在 validate 节点中确定，并随 Checkpoint 保存。 |
+| 20 | 怎样防止重复副作用？ | 模拟效果本身就是数据库记录，`record_action` 用唯一约束和短事务完成效果与登记。未知结果只允许显式恢复核查；不自动重试写工具。外部系统需自己的幂等/查询机制。 |
+| 21 | interrupt 如何暂停？ | `human_approval` 调用 `interrupt(pending_approval)`，框架持久化中断并返回；Service 发 approval_required，HTTP 请求结束，不占着 Python Event 等人。 |
+| 22 | Command 如何恢复？ | API 校验 ID/decision，拿跨进程锁确认中断后，向原 thread 传 `Command(resume=...)`。节点重新进入时 interrupt 返回这个决定。 |
+| 23 | 为什么 interrupt 前不能副作用？ | 恢复会重复执行该节点的前半段，所以审批节点只读状态、调用 interrupt、校验决定。动作写入在独立 execute_tool 中；批准前动作表为空。 |
+| 24 | HITL 与弹窗区别？ | 弹窗只是 UI；这里有服务端持久化审批内容、固定参数、工作流状态机、锁和恢复路径。浏览器或进程重启后批准仍作用于原操作。共享 token 仍不等于审批者身份授权。 |
+| 25 | SSE 断开为何不删除 Workflow？ | 网络断开不能撤销已提交的数据库操作；只取消当前 IO 并保留 checkpoint。`test_sse_disconnect_releases_io_pool_lock_and_keeps_checkpoint` 验证 plan/tool/commit 三种窗口。 |
+| 26 | Session 过期怎样处理？ | `commit_session` 读取原 ID/version，过期返回 expired，冲突返回 conflict；都不复活或覆盖旧 Session，独立 Incident 仍保存。业务输出显式返回 session_status。 |
+| 27 | 为何不能合并四类存储？ | Checkpoint 是执行游标；Workflow 表管状态/互斥关联；Incident 是业务结果；Session 是跨请求上下文；Cache 是可重建查询投影。它们的 TTL、权限、事务和恢复语义不同。 |
+| 28 | 什么时候 Graph 更合适？ | 任务跨请求、人工停顿、节点失败恢复或需重启后继续时；短小同步诊断的旧 loop 更容易理解，所以本版同时保留。 |
+| 29 | 增加哪些维护成本？ | LangGraph/checkpoint 版本兼容、psycopg 第二套 pool、官方内部迁移、状态 schema/隐私、checkpoint 保留与断线恢复测试；不只增加一个依赖包。 |
+| 30 | 仍有哪些生产限制？ | 无用户身份/RBAC/租户隔离、无后台调度、无生产写工具、无外部 fencing/通用 exactly-once、无跨 Redis/PG 原子事务、无完整 DLP；pending/failed 长期保留需额外运维策略。 |
+
+对应源码：[nodes.py](app/workflow/nodes.py)、[service.py](app/workflow/service.py)、
+[repository.py](app/workflow/repository.py)、[session_commit.py](app/workflow/session_commit.py)、
+[privacy.py](app/workflow/privacy.py)。
+
+### 四种恢复必须分别证明
+
+| 场景 | 入口 | 不变量 | 证据 |
+|---|---|---|---|
+| Node Retry | RetryPolicy 3 次有限尝试 | 仅只读工具/规划瞬时错误；取消、校验、拒绝不重试 | `test_transient_retry_is_bounded`、`test_cancellation_not_retried` |
+| Checkpoint Resume | 原 thread + `None` | 第一个已完成工具不执行，失败工具继续 | `test_m3_failed_node_resume_no_reexecution` |
+| Human Interrupt Resume | 原 thread + `Command(resume=...)` | 拒绝零动作、批准单动作、重复审批 409 | `test_m4_approval_restart_and_duplicate_requests`、`test_two_approvals_only_one_owner` |
+| Process Restart Recovery | 新 Python 进程/新连接 | 不依赖旧协程、内存锁或计数器 | `test_real_process_exit_then_approval_in_new_process`、`test_hard_process_crash_after_action_before_checkpoint` |
+
+### 理解三个提交窗口
+
+1. **动作已成功、Checkpoint 未成功**：崩溃测试在 `record_action` 提交后、execute_tool 返回前结束子进程。
+   新进程看到待执行 execute_tool，使用原 operation_id 查询/返回已存在记录，不产生第二条动作。
+2. **Redis EXEC 成功、客户端未收到响应**：回执和 Session 写在同一事务中。恢复先读回执，不再次追加。
+   回执独立于 Session TTL；真实 Redis 测试 `scenario=unknown` 验证 version 仍为 1。
+3. **Graph 已结束、Incident 提交失败/响应丢失**：前者只补业务提交；后者依据稳定 ID 与同事务 completed
+   状态核查，不重复写 Incident。两种情况都不重跑 Graph；分别有独立测试。
+
+这些机制是在各自系统中约束重复执行，**不是 Redis + PostgreSQL + 外部服务的分布式事务**。
+如果 Redis 灾难恢复丢失回执、工作流库与 Checkpoint 库恢复到不同时刻，当前实现没有自动一致性修复协议。
+真实高风险变更接入前，需要重新设计身份授权、目标系统幂等、执行所有权 fencing、超时结果核查和补偿。
+
+### 自己动手验证
+
+- 阅读 `test_multi_call_plan_resumes_each_call_at_its_own_boundary`，确认一个 LLM 响应里的多个工具仍逐节点执行。
+- 将只读工具 safety 改为未知值，观察 validate_tool 拒绝；不要通过 LLM 返回的“已批准”文字授权。
+- 比较 `status()` 返回的摘要和 `snapshot()` 的内部状态：HTTP 不应提供后者。
+- 对 completed 执行 prune，然后确认 Incident 仍存在；对 pending_approval 执行 prune，确认审批没有被删。
+- 阅读旧 `SessionRepository.commit` 与新的 `commit_session`：前者语义保留，后者增加独立回执以处理长工作流重试。
+- 检查 `JsonPlusSerializer` 的严格设置：禁用 pickle，禁止任意应用类型恢复；框架安全内置类型仍可用于 interrupt。

@@ -158,13 +158,13 @@ async def test_real_cli_migration_downgrade_upgrade_and_current(database):
         assert proc.returncode == 0, (stdout + stderr).decode()
         return stdout.decode()
     await engine.dispose()  # No stale prepared statements across DDL changes.
-    assert "0001_incident_records" in await cli("current")
+    assert "0002_workflows" in await cli("current")
     await cli("downgrade", "base")
     async with engine.connect() as connection:
         assert await connection.scalar(text("SELECT to_regclass('incident_records')")) is None
     await engine.dispose()
     await cli("upgrade", "head")
-    assert "0001_incident_records" in await cli("current")
+    assert "0002_workflows" in await cli("current")
     await IncidentRepository(async_sessionmaker(engine, expire_on_commit=False)).create_completed(**values())
     assert await count(engine) == 1
 

@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     )
 
     llm_mode: Literal["mock", "openai"] = "mock"
+    agent_engine: Literal["legacy", "langgraph"] = "legacy"
+    workflow_enabled: bool = False
+    workflow_local_demo: bool = False
+    workflow_api_token: SecretStr = SecretStr("")
+    checkpoint_database_url: SecretStr = SecretStr("")
+    workflow_retention_days: int = Field(default=7, ge=1, le=90)
     max_steps: int = Field(default=6, ge=1, le=100)
     llm_timeout_seconds: float = Field(default=30, gt=0, le=300)
     tool_timeout_seconds: float = Field(default=10, gt=0, le=300)
@@ -37,6 +43,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_provider(self) -> Self:
+        if self.agent_engine == "langgraph":
+            self.workflow_enabled = True
+        if self.workflow_enabled:
+            if not self.workflow_local_demo or len(self.workflow_api_token.get_secret_value()) < 32:
+                raise ValueError("Workflow requires local demo mode and a token of at least 32 characters")
+            validate_database_url(self.database_url.get_secret_value())
+            from app.workflow.checkpoint import validate_checkpoint_url
+            validate_checkpoint_url(self.checkpoint_database_url.get_secret_value())
         validate_key_prefix(self.cache_key_prefix)
         if self.cache_enabled and not self.incident_persistence_enabled:
             raise ValueError("CACHE_ENABLED requires INCIDENT_PERSISTENCE_ENABLED")

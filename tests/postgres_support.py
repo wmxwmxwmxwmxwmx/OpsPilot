@@ -1,4 +1,7 @@
-"""Shared isolated PostgreSQL fixture. Drops only its own random database."""
+"""Shared isolated PostgreSQL fixture. Retains random test databases for inspection.
+
+No DROP DATABASE is issued. Use a disposable cluster and stop it after testing.
+"""
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -38,12 +41,10 @@ async def database():
     # only for fixture provisioning; repository INSERTs always use begin/commit.
     admin = create_async_engine(parsed, isolation_level="AUTOCOMMIT", hide_parameters=True)
     name = "opspilot_test_m3_" + uuid4().hex
-    owned = False
     engine = None
     try:
         async with admin.connect() as connection:
-            await connection.execute(text(f'CREATE DATABASE "{name}" TEMPLATE template0'))
-            owned = True
+            await connection.execute(text(f'CREATE DATABASE "{name}" TEMPLATE template0 ENCODING \'UTF8\''))
         test_url = parsed.set(database=name).render_as_string(hide_password=False)
         engine = create_database_engine(test_url)
         async with engine.begin() as connection:
@@ -52,9 +53,6 @@ async def database():
     finally:
         if engine is not None:
             await engine.dispose()
-        if owned:
-            async with admin.connect() as connection:
-                # Only the UUID database created above, never the caller's DB.
-                await connection.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+        # Retain the owned database: V0.3 validation forbids DROP DATABASE.
         await admin.dispose()
 

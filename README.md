@@ -2,7 +2,7 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-当前版本 **V0.2-M4（Redis Cache）**，保留 M1 SSE、M2 Redis Session、M3 PostgreSQL 持久化，新增历史安全摘要的 Cache-Aside 查询。
+当前版本 **V0.3（LangGraph 持久化工作流）**，保留全部 V0.2 功能，新增独立 Workflow API、PostgreSQL Checkpoint、失败恢复和模拟动作人工审批。默认仍使用旧 Agent。
 这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
@@ -17,6 +17,7 @@
 - 可选 Redis Session：完整对话轮次、滑动 TTL、版本并发控制、提交成功后返回最终答案。
 - 可选 PostgreSQL Incident：脱敏问答、受限 JSONB 摘要、独立迁移与短事务；支持无状态/有状态诊断。
 - 可选 Redis Cache：历史 Incident 安全摘要、Cache-Aside、有限 TTL、主动失效和故障回源；提供本地查询 CLI。
+- 可选 LangGraph Workflow：节点边界持久化、失败节点恢复、跨进程人工审批、数据库互斥与模拟动作幂等；配置与示例见文末 V0.3。
 - `steps` 仅包含实际 Tool Call / Tool Result，不返回隐藏推理或中间模型文字。
 
 ## 架构与目录
@@ -816,8 +817,9 @@ UUID 仅用于关联，不能代替授权。Outbox、幂等请求与一致性修
 ### 真实 PostgreSQL 验证
 
 测试必须由环境变量显式启用，连接到名称以 `opspilot_test` 开头的专用 bootstrap 数据库，
-用户需 CREATEDB。fixture 每次创建随机 `opspilot_test_m3_<uuid>` 数据库，在其中迁移和测试，
-最后只删除该数据库；不迁移、不清空 bootstrap 数据库，也不访问已有业务数据库。
+用户需 CREATEDB。fixture 每次创建随机 UTF-8 `opspilot_test_m3_<uuid>` 数据库，在其中迁移和测试。
+V0.3 起保留这些测试数据库供核查，不执行 DROP DATABASE；请使用可丢弃的隔离实例，测试结束后停止实例。
+不迁移、不清空 bootstrap 数据库，也不访问已有业务数据库。
 Redis 测试只清理自己创建的随机 Key。
 
 ```bash
@@ -1108,7 +1110,7 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 ## Roadmap
 
-除已标注完成的 M1/M2/M3/M4 外，以下功能仍是规划。
+V0.2、V0.3 已完成；V0.4、V0.5 为后续规划。
 
 ### V0.2
 
@@ -1119,7 +1121,7 @@ Dockerfile 已提供；本次验收没有构建或运行 Docker 镜像。没有 
 
 ### V0.3
 
-LangGraph、Checkpoint、Failed Task Resume、Human-in-the-loop。
+**已完成**：LangGraph、PostgreSQL Checkpoint、Failed Task Resume、模拟动作 Human-in-the-loop。
 
 ### V0.4
 
@@ -1132,3 +1134,302 @@ pytest integration tests、k6 load testing、Mock LLM benchmark、performance tu
 M4 已复用内部 `IncidentRepository.get(id)`；认证、租户授权、缓存击穿保护和可靠失效仍需后续设计。
 当前未引入 XA、Saga、Outbox 或事件总线。
 先完成当前层的学习问答：[我作为 OpsPilot 作者必须能回答的问题](LEARNING.md)。
+
+## V0.3：LangGraph Durable Agent Workflows
+
+旧 `/api/v1/diagnose`、`/diagnose/stream`、`/sessions` 继续使用 `DiagnosisService` 和手写
+`Agent`。`AGENT_ENGINE=legacy` 为默认值；`AGENT_ENGINE=langgraph` 等效启用
+`WORKFLOW_ENABLED=true`，开启独立 `/api/v1/workflows` API，**不会悄悄改变旧接口的响应或执行语义**。
+也可以保留 legacy 并单独启用 Workflow。两套执行器复用 `BaseLLM`、三个只读工具和 `ToolRegistry`。
+
+依赖在 Python 3.11 实际安装验证：LangGraph **1.2.16**、langgraph-checkpoint **4.3.0**、
+langgraph-checkpoint-postgres **3.2.0**、psycopg **3.3.6**、psycopg-pool **3.3.3**。
+前三者固定版本，升级时应重新跑恢复测试。没有将旧 `Agent.run()` 包进单个节点。
+
+### 节点和持久化职责
+
+```mermaid
+flowchart TD
+    API[FastAPI /workflows + local token] --> S[WorkflowService]
+    S --> LOCK[PostgreSQL advisory lock]
+    LOCK --> START
+    START --> plan
+    plan -->|tool calls| validate_tool
+    plan -->|answer| finalize
+    validate_tool -->|read_only| execute_tool
+    validate_tool -->|approval_required| human_approval
+    human_approval -->|interrupt| PAUSE[Checkpoint + pending_approval]
+    PAUSE -->|Command resume / approve| human_approval
+    human_approval -->|approve| execute_tool
+    human_approval -->|reject: failed observation| NEXT{More queued calls?}
+    execute_tool --> NEXT
+    NEXT -->|yes| validate_tool
+    NEXT -->|no| plan
+    finalize --> END
+    END --> COMMIT[WorkflowService business commit]
+    COMMIT --> REDIS[Redis Session + receipt]
+    REDIS --> PG[Incident + completed status in one PG transaction]
+    PG --> SSE[final + workflow_completed]
+    S -. sync checkpoints .-> SAVER[AsyncPostgresSaver / psycopg pool]
+    SAVER --> CP[(PostgreSQL checkpoint tables)]
+```
+
+| 节点 | 实际行为 |
+|---|---|
+| `plan` | 调用现有 `BaseLLM.generate`，生成受限工具调用或脱敏答案；原始无效参数、模型推理和供应商 call ID 不入库 |
+| `validate_tool` | 再校验工具 Schema 和服务器安全元数据，确定稳定 operation ID，生成审批预览 |
+| `human_approval` | 调用官方 `interrupt()`；恢复只验证 approval ID 和 approve/reject，不写动作记录 |
+| `execute_tool` | 独立执行已批准工具；只读工具保持超时，结果按白名单投影；一次节点只执行一个调用 |
+| `finalize` | 仅标记内部 `graph_completed`；业务提交由 Service 统一完成 |
+
+代码见 [graph.py](app/workflow/graph.py)、[nodes.py](app/workflow/nodes.py)、
+[service.py](app/workflow/service.py)。规划消息使用不可变列表替换；工具结果使用
+`merge_results` 按服务器生成的 `call_id` 合并，避免重复追加。
+
+`GraphState` 包括 `schema_version`、workflow/session/incident ID、Session 起始 version、脱敏问题、
+LLM 消息、待执行调用、当前工具计划、结果、步数、答案、审批和内部状态。
+限制为最多 32 次规划（取 `min(MAX_STEPS, 32)`）、每次 8 个调用、总计 64 个调用、128 条消息、
+单工具结果 8 KiB、总状态 256 KiB；历史只取最后 20 条，每条最多 2,000 字符。
+问题最多 4,000 字符，答案最多 16,000 字符。工具参数限制 2 KiB，目前只允许只读空参数或模拟工具枚举。
+这些是 Graph 的额外边界，不改变旧 Agent 的限制。
+
+| 数据 | 标识与用途 |
+|---|---|
+| Workflow / Checkpoint | 每次执行新建 UUID4；`thread_id = workflow_id`，保存节点进度，不等于 session ID |
+| Redis Session | 可选跨请求对话历史；同一 Session 可以关联多个 Workflow，提交仍校验起始 version |
+| Incident | 创建 Workflow 时预分配独立 UUID4；只保存最终业务结果，Workflow 表对 incident ID 有唯一约束 |
+| Redis Cache | 继续缓存可重建的 Incident 安全摘要，不参与 Graph 决策和恢复 |
+
+应用表由 Alembic `0002_workflows` 管理；Checkpoint 四张内部表由 Saver 的 `setup()` 管理。
+Alembic 的 `include_object` 明确排除 `checkpoints/checkpoint_blobs/checkpoint_writes/checkpoint_migrations`。
+[checkpoint.py](app/workflow/checkpoint.py) 创建独立 psycopg pool，开启 autocommit、dict_row 和严格
+JsonPlusSerializer，关闭 pickle，限定反序列化模块。SQLAlchemy/asyncpg 的连接与事务不与它混用。
+FastAPI lifespan 创建/关闭 pool；**启动和请求均不执行 setup 或 Alembic**。
+
+### 启动与初始化
+
+```bash
+conda activate opspilot
+pip install -e '.[dev]'
+# 编辑 .env：以下 URL 为本地配置格式示例，请填写自己的凭据。
+```
+
+```dotenv
+AGENT_ENGINE=legacy
+WORKFLOW_ENABLED=true
+WORKFLOW_LOCAL_DEMO=true
+WORKFLOW_API_TOKEN=<至少32字符的本地随机令牌>
+DATABASE_URL=postgresql+asyncpg://opspilot:password@127.0.0.1:5432/opspilot
+MIGRATION_DATABASE_URL=postgresql+asyncpg://opspilot:password@127.0.0.1:5432/opspilot
+CHECKPOINT_DATABASE_URL=postgresql://opspilot:password@127.0.0.1:5432/opspilot
+WORKFLOW_RETENTION_DAYS=7
+LLM_MODE=mock
+```
+
+```bash
+# 只在首次部署或明确升级时执行，建议迁移账号与运行账号分离。
+alembic upgrade head
+python -m app.cli.checkpoints setup
+# setup 可重复执行，按 Saver 内部 migration version 升级。
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+Workflow 始终需要 PostgreSQL，并保存完成的 Incident；旧接口是否持久化仍由
+`INCIDENT_PERSISTENCE_ENABLED` 控制。可选 `SESSION_ENABLED=true` 时沿用 `REDIS_URL`。
+需要原有 Incident 查询 CLI/Cache 时同时启用 `INCIDENT_PERSISTENCE_ENABLED=true`。
+Workflow 的 Incident 不可变，初始写入不需要缓存失效；查询仍走 M4 的 Cache-Aside。
+
+### 四个演示与 API
+
+所有新 API 都需要相同的本地 Bearer token，默认关闭。可用交互输入避免把 token 写进 shell 历史：
+
+```bash
+read -rs -p 'Workflow token: ' WORKFLOW_TOKEN
+export WORKFLOW_TOKEN
+
+# 演示一：正常 LangGraph 诊断；返回 workflow_id/status/incident_id/answer。
+curl -s http://127.0.0.1:8000/api/v1/workflows \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"检查 Redis 和订单延迟","session_id":null}'
+
+# SSE：尽早发 workflow_start（带 workflow_id），然后输出本次执行的新事件。
+curl -N 'http://127.0.0.1:8000/api/v1/workflows?stream=true' \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"订单慢"}'
+
+# 演示四：确定性 Mock 触发词；审批前不会写模拟动作记录。
+curl -s http://127.0.0.1:8000/api/v1/workflows \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"mock remediation"}'
+
+# 从响应复制 workflow_id 和 pending_approval.approval_id。
+read -r -p 'workflow_id: ' WORKFLOW_ID
+read -r -p 'approval_id: ' APPROVAL_ID
+curl -s "http://127.0.0.1:8000/api/v1/workflows/$WORKFLOW_ID" \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN"
+
+# 演示二：此时停止并重新启动 uvicorn，再查询同一 ID，审批仍然存在。
+# approve 可以换成 reject；不接受修改工具参数或提交 GraphState。
+curl -N "http://127.0.0.1:8000/api/v1/workflows/$WORKFLOW_ID/approval?stream=true" \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"approval_id\":\"$APPROVAL_ID\",\"decision\":\"approve\"}"
+
+# 演示三：节点故障排除后，或者 SSE 断线后，恢复原 workflow。
+curl -s -X POST "http://127.0.0.1:8000/api/v1/workflows/$WORKFLOW_ID/resume" \
+  -H "Authorization: Bearer $WORKFLOW_TOKEN"
+```
+
+`POST /workflows` 创建并执行；`GET /{id}` 返回受控摘要；`POST /{id}/approval` 审批；
+`POST /{id}/resume` 恢复。三个执行接口均支持 `?stream=true`。失败执行的 JSON 返回 `status=failed`
+及安全 `error_code`；调用方必须检查业务状态，不能把 HTTP 200 当作 completed。
+非法状态、重复审批、已完成任务重跑为 409；无 token 为 403；功能关闭/未知 ID 为 404。
+状态查询不会暴露完整 GraphState、系统提示词或内部结果。
+
+无效工具名、参数和超限错误为不可恢复失败；外部故障可在排除原因后显式 resume。
+不提供 HTTP 故障注入开关；可重复运行以下真实故障测试演示失败、修复、恢复及副作用崩溃窗口：
+
+```bash
+pytest -q tests/test_workflow_postgres.py -k 'm3_failed_node or hard_process_crash'
+pytest -q tests/test_workflow_postgres.py -k real_process_exit
+```
+
+### Retry、Resume、审批与幂等
+
+`RetryPolicy` 只对包装为 `TransientWorkflowError` 的规划超时/连接错误、只读工具超时/连接错误重试：
+最多 3 次尝试，0.05s、0.1s 退避，上限 0.2s。校验失败、审批拒绝、Session 冲突和取消不自动重试。
+其他工具异常保留失败节点，等待显式 resume。模拟写动作没有自动重试。
+
+普通失败恢复为 `astream(None, original_thread_id, durability="sync")`；人工审批为
+`astream(Command(resume={approval_id, decision}), original_thread_id, durability="sync")`。
+已完成且 checkpoint 确认的节点不会重新开始；崩溃时尚未确认的节点、失败节点、interrupt 所在节点可能重跑。
+审批节点前不执行动作；拒绝生成 `success=false / approval_rejected` Observation，再继续规划。
+审批批准只允许执行已持久化的枚举参数，执行时再次检查服务器工具策略。
+
+`operation_id = SHA256(workflow_id + server_call_id + tool_name + canonical_arguments)`。
+[MockRemediationTool](app/tools/mock_remediation.py) 只有数据库模拟效果：
+`workflow_mock_actions.operation_id` 主键 + 短事务 `INSERT ON CONFLICT` 返回已有记录。
+若写入成功后进程崩溃，下一次显式恢复使用同一 operation ID 核查，不重复登记。
+它没有 shell、服务重启、配置修改或任意外部执行能力。
+
+[WorkflowRepository.lock](app/workflow/repository.py) 用 PostgreSQL 会话级 advisory lock 持有独立连接，
+覆盖整个执行/审批/业务提交；并发请求拿不到锁立即报 busy。进程退出后连接关闭，锁自动释放。
+没有把 `thread_id` 当锁，也没有依赖单进程 asyncio.Lock。LLM 执行期间不持有业务行事务，
+但会占用一条互斥连接；连接池限制了本地可同时运行的 Workflow 数量。
+
+最终提交先处理可选 Session，再在一个 PostgreSQL 事务中保存稳定 Incident ID 并把 Workflow 置为 completed。
+Graph 已结束但提交失败时，恢复只做提交；最终 COMMIT 响应丢失时，通过 Workflow 状态及稳定 ID 核查。
+这些约束不构成 Redis/PostgreSQL 跨存储事务。
+
+| Session 在恢复时的情况 | 策略与 `session_status` |
+|---|---|
+| 原会话和 version 有效 | WATCH 两个 key；一次 MULTI/EXEC 写新会话和 workflow 回执；`committed` |
+| TTL 已过期 | 不创建旧 Session；仍保存独立 Incident，返回 `expired` |
+| 被其他请求更新 | 不追加旧上下文答案；仍保存独立 Incident，返回 `conflict` |
+| Redis 提交响应丢失 | Workflow failed；显式恢复先查同事务回执，不重复追加 |
+| Redis 仍不可用 | 保持 failed，不发 final；恢复不重新执行 Graph |
+| Session 已确认但 Incident 提交失败 | 保留 Session 提交状态，恢复只补最终 PostgreSQL 事务 |
+
+工作流回执使用独立 `opspilot:workflow:session-commit:<workflow_id>` key，不与 Session/Cache 混用。
+回执没有 TTL，保证 Session 过期后仍可核查；完成后的维护命令删除对应回执。
+此策略依赖 Redis 不丢失已确认数据；跨存储灾难恢复仍需运维核查。
+
+### SSE、取消与状态
+
+工作流事件为 `workflow_start` / `workflow_resumed` → 本次节点的 `tool_call/tool_result` →
+`approval_required`、`workflow_failed`，或业务提交后的 `final` + `workflow_completed`。
+工具和 final 复用原事件模型/编码，新增事件由 `WorkflowEvent` 表达。
+客户端应读到 `workflow_completed`，同时检查其 `session_status`；不能把 `approval_required` 当 final。
+事件从 `astream(stream_mode="updates")` 的本次增量生成，不遍历 Checkpoint 历史结果进行重放。
+这是活动执行流，没有 SSE Last-Event-ID 或持久事件日志，不承诺消息投递 exactly-once。
+
+业务状态转换：created → running → pending_approval / failed / completed；
+pending_approval 经审批回 running；failed 只有 resumable 才能恢复；completed 禁止再执行。
+保留 cancelled 为终态，但本版没有主动取消 API。
+连接断开会取消当前 IO，清理异步生成器、pool/事务/锁，把未完成任务标记为可恢复失败。
+Checkpoint 不删除。硬崩溃可能留下 running；新进程获取锁后可恢复该状态。
+`durability="sync"` 在进入下一节点前等待持久化，但当前未确认节点仍可重跑。
+没有后台工作调度器；客户端断线后需要显式 resume。
+
+### 安全、保留和限制
+
+- 所有 Workflow API 需显式本地开关和至少 32 字符共享 token。**这不是用户身份认证、RBAC 或租户隔离**；持有 token 的本地操作者可访问该演示实例的 Workflow 摘要和审批。
+- 未分类工具默认 approval_required，但当前只允许内置 MockRemediationTool 执行审批写入，其他写工具 fail closed；本版不能用于真实生产运维变更。
+- Checkpoint 入库前脱敏配置凭据与常见 credential 形式，省略原始 SQL，仅保留工具数值白名单；严格 serializer 不接受任意应用类型。自由文本仍可能含业务隐私，不能视为完整 DLP。
+- 自动外部 tracing 在 Service 中显式关闭；运行期依赖、HTTP 客户端和数据库连接不入 GraphState。Checkpoint 数据库仍需访问控制、磁盘加密与备份策略。
+- `python -m app.cli.checkpoints prune` 清理超过 `WORKFLOW_RETENTION_DAYS` 的 completed threads 及对应 Session 回执，保留 Incident、Workflow 终态和动作审计；重复执行安全。每次最多处理 1,000 条，由操作者或外部定时任务调用。
+- pending/failed 记录不自动清理，以免删除待审批/恢复任务；长期挂起清理策略、取消接口、状态 schema 升级迁移和自动 reconciliation 是后续工作。
+- 没有外部副作用通用 exactly-once 保证。数据库模拟动作能在唯一约束事务内只登记一次，外部服务调用不能与这个事务原子提交；未来需要目标系统幂等 API、结果查询或人工补偿。
+- advisory lock 是数据库连接所有权，没有外部系统 fencing；数据库连接丢失/网络分区时不应将它当成生产变更平台的完整互斥方案。
+
+### 自动化验收
+
+```bash
+# 离线：禁止 HTTP、Redis TCP、asyncpg、psycopg 访问真实网络。
+pytest -q -m 'not postgres_integration and not redis_integration'
+
+# 独立的隔离 PostgreSQL/Redis；测试账号只用于该隔离实例。
+export OPSPILOT_TEST_POSTGRES_URL='postgresql+asyncpg://test_user:password@127.0.0.1:15432/opspilot_test'
+export OPSPILOT_TEST_REDIS_URL='redis://127.0.0.1:16379/0'
+pytest -q -m 'postgres_integration or redis_integration'
+pytest -q
+```
+
+2026-10-18 开发前：Conda Python 3.11.16，**300 passed / 36 skipped**。
+本次执行环境默认 Python 3.14 无 pytest，因此从现有 Conda Python 3.11 创建了
+`/tmp/opspilot-v03-venv`，复用原依赖并安装新依赖；随后已在原 `opspilot` Conda 环境执行
+`pip install -e '.[dev]'`，最终验收使用原 Conda 环境。
+真实数据库为 `/tmp/opspilot-v03-runtime` 中的 PostgreSQL 18.6（25432）和 Redis 8.0.5（26379），
+仅监听本机，未操作 M3 数据库，未执行 FLUSHALL、DROP DATABASE、git commit 或 push。
+
+核心验证文件：
+
+- [test_workflow_graph.py](tests/test_workflow_graph.py)：实际 StateGraph、工具队列、限制、隐私、重试、失败恢复、审批及取消。
+- [test_workflow_api.py](tests/test_workflow_api.py)：默认关闭、配置门控、严格 serializer、两种数据库 URL。
+- [test_workflow_sessions.py](tests/test_workflow_sessions.py)：回执核查、过期/冲突、响应未知。
+- [test_workflow_postgres.py](tests/test_workflow_postgres.py)：官方 Saver、重建连接、两个 Python 进程、强制崩溃窗口、并发审批、SSE 取消、真实 Redis 和 retention。
+
+官方 API 依据：[StateGraph](https://docs.langchain.com/oss/python/langgraph/graph-api)、
+[Checkpointers](https://docs.langchain.com/oss/python/langgraph/persistence)、
+[Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)、
+[RetryPolicy](https://reference.langchain.com/python/langgraph/types/RetryPolicy)、
+[PostgreSQL Saver / 严格序列化](https://reference.langchain.com/python/langgraph.checkpoint.postgres)。
+
+### V0.3 最终验收记录与修改清单
+
+最终使用原 Conda `opspilot` 的 Python 3.11.16 执行全量测试：
+**396 passed，0 failed，0 skipped，15.51s**。JUnit 报告保存在
+`/tmp/opspilot-v03-results.xml`。下表按 pytest integration marker 分开统计这次全量运行的结果；
+两类测试也在开发期间分别执行过。
+
+| 测试组 | 通过 | 说明 |
+|---|---:|---|
+| 离线测试 | 336 | 不访问真实 HTTP/Redis/PostgreSQL；包括原 300 项和新增 36 项 |
+| 真实 PostgreSQL / Redis 集成 | 60 | 原 36 项 + V0.3 新增 24 项；使用官方 AsyncPostgresSaver |
+| 全部回归 | 396 | 原 336 项全部保留，新增 60 项；无跳过 |
+
+`pip check` 无依赖冲突，`git diff --check` 通过，README/LEARNING 的本地文件链接均有效。
+测试中仅在新建隔离数据库运行迁移与回滚；不删除数据库。完成后停止本次 PostgreSQL/Redis 实例，
+保留 `/tmp/opspilot-v03-runtime` 数据目录供核查。
+
+| 内部里程碑 | 验收结果 |
+|---|---|
+| M1 LangGraph Integration | StateGraph 真正执行规划、校验、单工具执行、结束；正常 Mock 诊断通过 |
+| M2 Persistent Checkpoint | PostgreSQL 初始化/重建 pool/读取中断/跨进程恢复/序列化隐私通过 |
+| M3 Failed Task Resume | 已完成工具不重跑；有限 Retry、业务提交补偿、动作响应丢失和强制崩溃恢复通过 |
+| M4 Human-in-the-loop | 批准前零动作、拒绝零动作、批准单动作、重复/并发审批防护、进程重启后审批通过 |
+
+共 **38 个文件**（新增 22，修改 16），未创建 Git commit 或 push：
+
+| 范围 | 文件 |
+|---|---|
+| 新增 Graph 核心 | `app/workflow/__init__.py`, `state.py`, `graph.py`, `nodes.py`, `errors.py`, `events.py`, `privacy.py` |
+| 新增持久化与服务 | `app/workflow/checkpoint.py`, `models.py`, `repository.py`, `service.py`, `session_commit.py`, `runtime.py`, `mock.py` |
+| 新增入口、工具和迁移 | `app/api/workflows.py`, `app/cli/checkpoints.py`, `app/tools/mock_remediation.py`, `alembic/versions/0002_workflows.py` |
+| 新增测试 | `tests/test_workflow_graph.py`, `tests/test_workflow_api.py`, `tests/test_workflow_sessions.py`, `tests/test_workflow_postgres.py` |
+| 应用接入与安全元数据 | `app/main.py`, `app/core/config.py`, `app/core/logging.py`, `app/incident/schemas.py`, `app/tools/registry.py`, `app/tools/system_metrics.py`, `app/tools/mysql_diagnostics.py`, `app/tools/redis_diagnostics.py` |
+| 迁移、测试与依赖 | `alembic/env.py`, `tests/conftest.py`, `tests/postgres_support.py`, `tests/test_postgres_integration.py`, `pyproject.toml` |
+| 文档与配置 | `README.md`, `LEARNING.md`, `.env.example` |
+
+未修改旧 `app/agent/`、`app/llm/`、`app/session/`、`app/services/`、`app/cache/`、
+`IncidentRepository`、原诊断/SSE/Session 路由和 SSE 编码/断线响应类。三个旧工具只增加安全元数据，
+原执行实现保持不变。原 PostgreSQL 测试仅更新 migration head 断言，fixture 改为保留隔离数据库并明确 UTF-8。

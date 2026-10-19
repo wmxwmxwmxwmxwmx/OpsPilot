@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -17,6 +17,7 @@ from app.agent.schemas import AgentExecutionError
 from app.api.diagnose import router as diagnose_router
 from app.api.health import router as health_router
 from app.api.sessions import router as sessions_router
+from app.api.workflows import router as workflows_router
 from app.cache.repository import CacheRepository
 from app.core.config import Settings
 from app.core.logging import RequestLoggingMiddleware, configure_logging, log_event
@@ -33,6 +34,7 @@ from app.tools.mysql_diagnostics import MySQLDiagnosticsTool
 from app.tools.redis_diagnostics import RedisDiagnosticsTool
 from app.tools.registry import ToolRegistry
 from app.tools.system_metrics import SystemMetricsTool
+from app.workflow.errors import WorkflowError
 
 
 def build_registry() -> ToolRegistry:
@@ -62,6 +64,8 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
             application.state.incidents = None
             application.state.incident_cache = None
             application.state.incident_queries = None
+            application.state.workflows = None
+            workflow_stack = AsyncExitStack()
             try:
                 if config.session_enabled or config.cache_enabled:
                     # One lazy application client/pool for the same Redis URL.
@@ -99,19 +103,37 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                     application.state.incident_queries = IncidentQueryService(
                         application.state.incidents, application.state.incident_cache,
                     )
+                if config.workflow_enabled:
+                    from app.workflow.runtime import workflow_service
+                    if engine is None:
+                        engine = create_database_engine(config.database_url.get_secret_value())
+                    application.state.workflows = await workflow_stack.enter_async_context(
+                        workflow_service(config, engine, model if config.llm_mode != "mock" or llm else None,
+                                         application.state.sessions))
+                    application.state.workflow_token = config.workflow_api_token.get_secret_value()
                 yield
             finally:
                 try:
-                    if engine is not None:
-                        await engine.dispose()
+                    await workflow_stack.aclose()
                 finally:
-                    if redis_client is not None:
-                        await redis_client.aclose()
+                    try:
+                        if engine is not None:
+                            await engine.dispose()
+                    finally:
+                        if redis_client is not None:
+                            await redis_client.aclose()
 
-    application = FastAPI(title="OpsPilot", version="0.1.0", lifespan=lifespan)
+    application = FastAPI(title="OpsPilot", version="0.3.0", lifespan=lifespan)
     application.include_router(health_router)
     application.include_router(diagnose_router)
     application.include_router(sessions_router)
+    application.include_router(workflows_router)
+
+    @application.exception_handler(WorkflowError)
+    async def workflow_error_handler(request: Request, error: WorkflowError) -> JSONResponse:
+        return JSONResponse(status_code=error.status_code, content={"error": {
+            "code": error.code, "message": error.code,
+        }})
 
     @application.exception_handler(IncidentError)
     async def incident_error_handler(request: Request, error: IncidentError) -> JSONResponse:
@@ -144,6 +166,8 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                    "请求格式错误；message 必须为 1–4000 字符的非空字符串。")
         if request.scope.get("path") == "/api/v1/sessions":
             message = "创建会话无需参数，不接受客户端指定的会话标识或其他字段。"
+        if request.scope.get("path", "").startswith("/api/v1/workflows"):
+            message = "工作流请求格式错误；请检查 UUID、message 和审批 decision，不接受 GraphState。"
         return JSONResponse(status_code=422, content={"error": {
             "code": "invalid_request", "message": message,
         }})

@@ -16,6 +16,9 @@ class Tool(ABC, Generic[InputT]):
     name: str
     description: str
     input_schema: type[InputT]
+    # Fail closed in the durable engine. Legacy execution keeps its API semantics.
+    safety: str = "approval_required"
+    checkpoint_fields: tuple[str, ...] = ()
 
     @abstractmethod
     async def execute(self, arguments: InputT) -> dict[str, Any]:

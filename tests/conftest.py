@@ -25,6 +25,8 @@ def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch, request: py
         monkeypatch.setattr(Connection, "_connect", deny_network)
     if request.node.get_closest_marker("postgres_integration") is None:
         monkeypatch.setattr(asyncpg, "connect", deny_network)
+        import psycopg
+        monkeypatch.setattr(psycopg.AsyncConnection, "connect", deny_network)
 
 
 @pytest.fixture
