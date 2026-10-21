@@ -4,10 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opspilot"
-version = "0.3.0"
+version = "0.4.0"
 description = "Enterprise AI SRE & Incident Diagnosis Agent — learning foundation"
 requires-python = ">=3.11,<3.12"
 dependencies = [
+    "mcp==2.3.0",
+    "pgvector==0.4.2",
+    "prometheus-client==0.26.0",
+    "opentelemetry-sdk==1.45.1",
+    "opentelemetry-exporter-otlp-proto-http==1.45.1",
+    "jsonschema>=4.23,<5",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
     "pydantic>=2.9,<3",
@@ -24,10 +30,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "fakeredis>=2.26,<3"]
+dev = ["PyYAML>=6,<7", "pytest>=8,<10", "pytest-asyncio>=0.24,<2", "fakeredis>=2.26,<3"]
 
 [project.scripts]
 opspilot-incident-summary = "app.cli.incident_summary:main"
+opspilot-runbooks = "app.cli.runbooks:main"
 opspilot-checkpoints = "app.cli.checkpoints:main"
 
 [tool.setuptools.packages.find]
@@ -39,6 +46,9 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    "mcp_integration: opt-in real loopback MCP HTTP tests (OPSPILOT_TEST_MCP=1)",
+    "embedding_integration: opt-in configured real embedding provider",
+    "observability_integration: live Prometheus/Grafana/Tempo acceptance",
     "redis_integration: opt-in real Redis tests (OPSPILOT_TEST_REDIS_URL)",
     "postgres_integration: opt-in isolated PostgreSQL tests (OPSPILOT_TEST_POSTGRES_URL)",
 ]

@@ -2,7 +2,7 @@
 
 **OpsPilot — Enterprise AI SRE & Incident Diagnosis Agent**
 
-当前版本 **V0.3（LangGraph 持久化工作流）**，保留全部 V0.2 功能，新增独立 Workflow API、PostgreSQL Checkpoint、失败恢复和模拟动作人工审批。默认仍使用旧 Agent。
+当前版本 **V0.4（Runbook / MCP / Observability）**，保留 V0.1–V0.3，新增 pgvector Runbook 检索、受控 MCP 工具、Prometheus、Grafana 和 OpenTelemetry/Tempo。默认仍使用旧 Agent，新能力显式启用；V0.4 启动与验收见文末。
 这是用于学习和扩展的单 Agent 运维诊断后端基础，不是可直接上线的生产运维平台。
 它以 FastAPI、异步 Python、可替换的 LLM 接口、手写 Agent Loop 和工具注册表完成一次完整诊断。
 默认 `LLM_MODE=mock`，不需要 API Key，也不访问真实 MySQL、Redis 或生产服务器。
@@ -1433,3 +1433,294 @@ pytest -q
 未修改旧 `app/agent/`、`app/llm/`、`app/session/`、`app/services/`、`app/cache/`、
 `IncidentRepository`、原诊断/SSE/Session 路由和 SSE 编码/断线响应类。三个旧工具只增加安全元数据，
 原执行实现保持不变。原 PostgreSQL 测试仅更新 migration head 断言，fixture 改为保留隔离数据库并明确 UTF-8。
+
+## V0.4：Runbook、MCP 与可观测性
+
+V0.4 在现有 Workflow API 中串联知识检索、受控远端工具、业务持久化和遥测。所有新开关默认关闭，
+旧 `/api/v1/diagnose`、SSE、Redis Session、Incident、Cache 和 V0.3 审批/恢复继续保留。
+完整逐文件清单、阶段结果和实际验收证据见 [V0.4 验收报告](docs/V0.4-ACCEPTANCE.md)。
+
+```mermaid
+flowchart TD
+    U[HTTP / SSE Client] --> API[FastAPI /api/v1/workflows]
+    API --> WS[WorkflowService + PostgreSQL advisory lock]
+    WS --> R[LangGraph retrieve_runbook]
+    R --> E[EmbeddingProvider]
+    E --> V[RunbookRepository / pgvector exact cosine search]
+    V --> C[bounded chunks + version + citations]
+    C --> P[plan / BaseLLM]
+    P --> T[validate_tool / ToolRegistry]
+    T --> H[human_approval for existing mock writes]
+    T --> X[execute_tool]
+    H --> X
+    X --> L[local tools]
+    X --> A[MCPTool Adapter]
+    A --> MC[MCPClient / Streamable HTTP]
+    MC --> MS[Independent MCP mock server]
+    MS --> P
+    L --> P
+    P --> F[finalize / canonical references]
+    F --> S[Redis session commit receipt]
+    S --> I[Incident + completed workflow transaction]
+    I --> U
+    WS -. node checkpoints .-> CP[AsyncPostgresSaver]
+    API -. request-scoped metrics .-> MET[/metrics]
+    MET --> PROM[Prometheus]
+    PROM --> G[Grafana provisioned dashboard]
+    API -. OpenTelemetry spans .-> OTLP[OTLP HTTP exporter]
+    MS -. W3C context / remote spans .-> OTLP
+    OTLP --> TEMPO[Tempo]
+    TEMPO --> G
+```
+
+### 依赖与兼容模式
+
+```bash
+conda activate opspilot
+pip install -e '.[dev]'
+# 全部 V0.4 功能关闭：与 V0.3 相同，不连接 MCP 或 Embedding API。
+RAG_ENABLED=false MCP_ENABLED=false METRICS_ENABLED=false TRACING_ENABLED=false \
+  uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+官方 MCP SDK 固定 **2.3.0**，全部使用 v2 `Client`、`MCPServer`、snake_case 类型属性和
+`httpx2` Streamable HTTP。应用原来的 `httpx` 仍服务 LLM/Embedding；不混用两套 transport。
+版本依据：[MCP v2.3.0 发布](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.3.0)。
+`RAG_ENABLED`/`MCP_ENABLED` 需要启用 Workflow；旧手写 Agent 不会静默切换到新引擎。
+
+### PostgreSQL、pgvector 与 Runbook 索引
+
+先检查目标数据库是否支持扩展（只读）：
+
+```sql
+SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'vector';
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+```
+
+没有可用扩展时，需要管理员在适合的测试实例安装对应 PostgreSQL 版本的 pgvector。
+应用不会安装扩展，不提供字符串匹配替代向量检索。
+仅在**明确获授权的目标数据库**中由管理员执行：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+然后用 V0.3 的独立迁移账户执行：
+
+```bash
+alembic upgrade head
+python -m app.cli.checkpoints setup
+```
+
+`0003_runbooks` 在扩展缺失时中止，不隐式 `CREATE EXTENSION`。已有数据库仅使用 V0.3 功能时可保持
+`0002_workflows`；启用 RAG 前必须迁移到 `0003_runbooks`。回滚只删除 Runbook 表，不删除共享扩展。
+新表由 SQLAlchemy metadata 和 Alembic 管理；`vector` 列支持不同维度，数据库 CHECK 强制实际向量长度
+与 `dimensions` 一致。查询先用 MATERIALIZED CTE 限定模型/维度，再执行精确 `<=>` 余弦距离；没有 HNSW。
+
+六份开发 Runbook 位于 [runbooks](runbooks)，包含 ID、版本、组件、日期、检查步骤、风险和官方技术来源。
+Loader 拒绝越界 symlink 和超过 256 KiB 的文档；Splitter 优先按标题/段落、再按长度切分。
+
+```dotenv
+# 沿用 V0.3 WORKFLOW_ENABLED、WORKFLOW_LOCAL_DEMO、WORKFLOW_API_TOKEN、DATABASE_URL 等配置
+RAG_ENABLED=true
+RAG_TOP_K=4
+RAG_MAX_CONTEXT_CHARS=4000
+RAG_MIN_SCORE=0.35
+RAG_CHUNK_SIZE=1000
+RAG_CHUNK_OVERLAP=120
+RAG_EMBEDDING_PROVIDER=fake
+RAG_EMBEDDING_MODEL=fake-hash-v1
+RAG_EMBEDDING_DIMENSIONS=64
+```
+
+```bash
+python -m app.cli.runbooks
+# 第二次应显示 imported=0、unchanged=6；文档编辑或版本升级后再次导入。
+```
+
+Fake 使用确定性 token hash，仅用于离线测试、去重和调用链演示。它可能命中无关段落，**不能用于评估
+语义召回质量**。真实 Embedding 采用明确配置的兼容 `/embeddings` HTTP API，无自动模型下载：
+
+```dotenv
+RAG_EMBEDDING_PROVIDER=api
+RAG_EMBEDDING_BASE_URL=https://your-approved-provider.example/v1
+RAG_EMBEDDING_API_KEY=<在本地配置，不提交>
+RAG_EMBEDDING_MODEL=<供应商真实支持且具有版本含义的模型 ID>
+RAG_EMBEDDING_DIMENSIONS=<该模型支持的向量维度>
+```
+
+API 必须支持 `model/input/dimensions` 请求字段。响应检查索引、数量、维度、有限值和非零向量。
+更换模型/维度后**重新导入所有文档**；查询不会重新嵌入知识库，也不会混搜不同模型/维度。
+相同模型名若被供应商替换权重，应使用新的版本 ID 或独立索引库；本版没有双索引原子切换。
+每个文档的旧 Chunk 在短事务中整体替换，导入按 document ID 获取事务 advisory lock；不删除磁盘上
+已经移走文档的旧索引，删除文档需管理员显式维护。原始 Markdown 由 Git 管理，数据库保留当前索引版本。
+
+`retrieve_runbook` 用受控关键词判断是否需要检索，用当前问题作查询；只保存当前 Top-K 和有限内容。
+检索异常可降级，取消不被吞掉；无可靠命中明确说明。参考作为低信任 `user` 数据消息传入，绝不拼入
+System Prompt。最终引用由服务端从真实结果生成，包含路径、版本、章节、Chunk ID；未知 Markdown 来源
+被省略。自由文本推理仍可能产生错误，提示词与引用过滤不构成完整 Prompt Injection 防御或事实验证器。
+
+### MCP 启动、安全和故障演示
+
+```bash
+# 终端 1；默认 127.0.0.1:8765，仅模拟数据，不连接生产系统。
+python -m app.mcp.server
+# 终端 2
+MCP_ENABLED=true MCP_SERVER_URL=http://127.0.0.1:8765/mcp \
+  uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+本版工具为 `mcp_get_mock_system_metrics`、`mcp_get_mock_redis_metrics`、`mcp_get_mock_mysql_status`。
+MockLLM 遇到 Redis/缓存问题且有 MCP 注册工具时会选择 MCP Redis 工具，模拟命中率 **42%**，与旧本地
+Redis 工具的 **96%** 明确区分。真实 LLM 使用同一 ToolDefinition 协议自行选择。
+
+MCP URL 仅允许显式 loopback IP、端口和 `/mcp`，不允许 LLM 提交 URL，不接受 DNS 主机名、query、
+凭据或重定向。Discovery 只接纳本地审阅目录中的工具和空对象参数 Schema；模型使用本地说明，
+服务端 annotations 不是权限来源。响应在 HTTP 流读取时限制 64 KiB，再做结构/结果校验和数值白名单投影。
+连接/调用由一个 Adapter 实现统一超时和取消；每次操作创建有界会话并关闭，避免跨任务 CancelScope
+和恢复后的旧 Trace 上下文。外部工具未知或有副作用时拒绝注册/执行；现有 MockRemediationTool 仍走
+V0.3 人工审批及幂等路径。**没有通用 MCP 写操作授权或外部副作用 exactly-once 能力。**
+
+服务必须在启用 MCP 的应用启动前可访问；启动 discovery 失败会拒绝就绪。运行中的 MCP 工具失败会
+形成安全 Workflow 失败，可在服务恢复后显式 resume。默认无 MCP 自动重试。
+
+受控故障演示：停止本地 MCP 进程后用 `python -m app.mcp.server --fail-redis` 重启，发起 Redis
+Workflow，观察 failed 和错误 Counter。随后正常重启 MCP，再调用原 `/workflows/{id}/resume`。
+此开关只属于模拟服务器启动参数，没有 HTTP 故障注入接口。
+
+### Metrics、Grafana 和网络
+
+```dotenv
+METRICS_ENABLED=true
+METRICS_ALLOWED_CIDRS=["127.0.0.0/8","::1/128"]
+# 可选，至少32字符。启用后 IP 和 Bearer token 两者都必须匹配。
+METRICS_TOKEN=
+```
+
+`/metrics` 关闭时 404；不在直接 peer IP allowlist 或 token 错误时 403。不会信任 `X-Forwarded-For`。
+每个应用实例有独立 CollectorRegistry，测试不重复注册。Label 只使用受控 component、operation、event、
+outcome、路由模板、方法和状态码。`operation` 中的工具名称来自本地注册目录，不含用户输入和 ID。
+HTTP 时长覆盖整个 SSE，业务成功仅在 Session/Incident 提交后的终态计数；pending_approval 独立统计。
+`opspilot_active_executions` 是当前执行段，不是跨进程持久待审批总数。耗时统一秒。
+Cache 复用 `CacheRepository._log` 的现有事件边界计数，不另跑一套 Cache-Aside。
+
+```bash
+# 先检查 3000/9090/3200/4318 是否已被占用
+ss -ltn
+export GRAFANA_ADMIN_PASSWORD='<本地随机密码>'
+docker compose -f deploy/observability/compose.yaml config
+docker compose -f deploy/observability/compose.yaml up -d
+# 只停止本监控项目，保留 volumes：
+# docker compose -f deploy/observability/compose.yaml stop
+```
+
+Compose 不启动或修改 PostgreSQL/Redis，使用独立 project name，无固定 container_name，镜像固定为
+Prometheus 3.15.0、Grafana OSS 13.2.4、Tempo 2.9.0；所有发布端口绑定 localhost。Prometheus 保存 7 天，
+Tempo 保存 24 小时。Grafana 登录 `http://127.0.0.1:3000`（admin + 上述密码），Dashboard UID 为
+`opspilot-agent`；配置和 JSON 位于 [deploy/observability](deploy/observability)。Grafana 不负责 scrape
+或存储 Prometheus 时序数据。
+
+**WSL 网络必须实际验证。** Compose 的 `host.docker.internal:host-gateway` 指向 Docker host，
+不保证指向当前 WSL 发行版。容器内 127.0.0.1 是容器自己。使用容器 scrape 时，需要：
+
+1. FastAPI 监听容器可达的 WSL/host 地址（必要时 `--host 0.0.0.0`，同时配置宿主防火墙）。
+2. 根据实际 Docker 网络只允许监控网络 CIDR，建议同时设置 token 和 Prometheus `authorization.credentials_file`。
+3. 在 Prometheus `/targets` 确认 UP；必要时把 `prometheus.yml` target 改成实际可达的 WSL IP。
+
+不要为了让 UP 出现而把 CIDR 改为 `0.0.0.0/0`。本次 WSL 没有 Docker 集成，因此实际验收采用已校验
+官方二进制，Prometheus 与应用同处 WSL、target 为 `127.0.0.1:18000`；没有声称 Compose 网络已跑通。
+原生启动可以复用配置，将 Tempo 数据路径改为独立可写目录，并设置 Grafana 的 `PROMETHEUS_URL`、
+`TEMPO_URL`、`DASHBOARD_PATH` 和 provisioning 路径。
+
+实际 PromQL（与 Dashboard JSON 一致）：
+
+```promql
+sum by (route) (rate(opspilot_http_requests_total[5m]))
+sum(rate(opspilot_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(opspilot_http_requests_total[5m])), 0.001)
+histogram_quantile(0.95, sum by (le) (rate(opspilot_http_duration_seconds_bucket[5m])))
+sum by (component, event) (rate(opspilot_events_total{component=~"agent|workflow",event=~"completed|failed|cancelled"}[5m]))
+sum by (operation) (rate(opspilot_operations_total{component="tool",outcome="error"}[5m]))
+histogram_quantile(0.95, sum by (le) (rate(opspilot_operation_duration_seconds_bucket{component="rag"}[5m])))
+sum by (event) (rate(opspilot_events_total{component="cache",event=~"hit|miss"}[5m]))
+```
+
+没有事件的标签组合可能还不存在；`rate` 至少需要两次 scrape，延迟分位数还需要窗口中有观测。
+不要把尚无样本的空图解释成故障率为零。`component=agent` 的终态为旧 DiagnosisService，
+`component=workflow` 的终态为持久化 LangGraph 执行；Dashboard 分别呈现。
+当前只支持单进程采集；不要在多 worker 下合并错误的单进程值。生产多进程需要在进程启动前配置
+`PROMETHEUS_MULTIPROC_DIR`、独立 multiprocess registry、Gauge live 模式和 worker 退出清理，或改为逐 worker scrape。
+
+### Trace / OTLP / Tempo
+
+```dotenv
+TRACING_ENABLED=true
+OTEL_SERVICE_NAME=opspilot
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+TRACE_SAMPLE_RATIO=1.0
+```
+
+MCP Server 进程同样启用 tracing，服务名设 `opspilot-mcp`。OTLP 地址是完整 HTTP `/v1/traces` endpoint，
+不是 gRPC 4317。应用 lifespan 管理私有 TracerProvider、BatchSpanProcessor 和 exporter 关闭；不修改
+全局 tracer。FastAPI 使用手动纯 ASGI instrumentation，覆盖 SSE 生命周期，避免自动采集完整 URL、
+headers 和异常正文。LLM/节点/工具/Embedding/向量查询/Incident 使用安全手工 Span。
+
+HTTP 响应的 `X-Trace-ID` 可用于 Grafana Explore → OpsPilot Tempo 查询。客户端将 W3C `traceparent`
+传到 MCP HTTP，官方 SDK 也支持请求 `_meta` 中的 W3C context；真实 HTTP 测试验证同 Trace 的父子关系。
+每次 resume 创建新执行 Span/Trace，用 `workflow.id` 与 `thread.id` 属性关联，不跨审批等待保持 Span。
+没有实现 Span Links 或持久 Trace 索引，ID 不进入 Prometheus labels。
+
+```text
+POST /api/v1/workflows
+└─ workflow.execution
+   ├─ node.retrieve_runbook → rag.retrieve → embedding.generate / vector.search
+   ├─ node.plan → llm.generate
+   ├─ node.validate_tool
+   ├─ node.execute_tool → tool.mcp_get_mock_redis_metrics → mcp.call
+   │  └─ remote HTTP / remote_tool.get_mock_redis_metrics（同 Trace）
+   ├─ node.plan → llm.generate
+   ├─ node.finalize
+   └─ persistence.incident
+```
+
+不记录完整问题、Prompt、Runbook 内容、Observation、凭据、LLM 输入输出或伪造 token usage。
+Span 仅包含受控名称、状态、HTTP 模板和 Workflow ID。错误用固定错误码，不记录原始异常正文。
+Exporter 采用有界队列异步导出；后端故障允许丢 Trace，不阻塞诊断。取消继续传播，异步生成器只在
+`anext`/关闭期间 attach Span，yield 前 detach，防止 ContextVar 泄漏。
+
+### 完整诊断与验收命令
+
+按前文完成迁移、导入、MCP、应用和监控启动后：
+
+```bash
+curl -N 'http://127.0.0.1:8000/api/v1/workflows?stream=true' \
+  -H "Authorization: Bearer $WORKFLOW_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"Redis 缓存命中率突然下降，请帮我排查原因，并参考运维 Runbook 给出建议。"}'
+# token 若启用，增加对应 Authorization header
+curl http://127.0.0.1:8000/metrics
+# 同时检查 Targets、Dashboard、Grafana 代理 PromQL 和 Tempo 完整 Span：
+python -m app.cli.observability_check --output /tmp/opspilot-observability.json
+```
+
+CLI 从环境读取 `WORKFLOW_API_TOKEN` 和 `GRAFANA_ADMIN_PASSWORD`；会创建新的诊断/Incident。
+若尚无 RAG Histogram，会先创建一条预热诊断并等待 scrape，再创建正式验收请求，以验证真实计数增量和 P95。
+可用 `--app/--prometheus/--grafana/--tempo` 指定隔离端口。它不更改外部监控配置。
+
+```bash
+# 离线回归
+pytest -q -m 'not postgres_integration and not redis_integration and not mcp_integration and not embedding_integration'
+# 真实隔离数据库和独立 loopback MCP（保留随机测试数据库，无 DROP DATABASE / FLUSHALL）
+export OPSPILOT_TEST_POSTGRES_URL='postgresql+asyncpg://test_user:password@127.0.0.1:25432/opspilot_test_v04'
+export OPSPILOT_TEST_REDIS_URL='redis://127.0.0.1:26379/0'
+export OPSPILOT_TEST_MCP=1
+pytest -q
+# 独立真实语义检索测试，缺少任一项会明确 skip，不用 fake 替代：
+export OPSPILOT_TEST_EMBEDDING_URL='<授权 API root>'
+export OPSPILOT_TEST_EMBEDDING_KEY='<本地配置>'
+export OPSPILOT_TEST_EMBEDDING_MODEL='<实际模型>'
+export OPSPILOT_TEST_EMBEDDING_DIMENSIONS='<实际维度>'
+pytest -q tests/test_embedding_live.py
+```
+
+当前限制：真实语义质量仍需配置 API 后验证；检索策略为简单关键词门控和向量 Top-K，没有 reranker；
+MCP 仅本机审阅只读工具；共享 token 不是 RBAC/多租户认证；没有生产变更或自动修复。
+知识/Trace 的访问控制、备份、脱敏、保留策略和采样成本都需要生产部署另行设计。

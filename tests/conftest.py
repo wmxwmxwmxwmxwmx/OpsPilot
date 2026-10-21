@@ -18,7 +18,14 @@ def isolate_environment_and_network(monkeypatch: pytest.MonkeyPatch, request: py
     async def deny_network(*args: object, **kwargs: object) -> None:
         raise AssertionError("Tests must not use real HTTP transport")
 
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", deny_network)
+    import os
+    import httpx2
+    if request.node.get_closest_marker("mcp_integration") and not os.getenv("OPSPILOT_TEST_MCP"):
+        pytest.skip("Set OPSPILOT_TEST_MCP=1 for real loopback HTTP")
+    if not request.node.get_closest_marker("embedding_integration"):
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", deny_network)
+    if not request.node.get_closest_marker("mcp_integration"):
+        monkeypatch.setattr(httpx2.AsyncHTTPTransport, "handle_async_request", deny_network)
     if request.node.get_closest_marker("redis_integration") is None:
         # FakeRedis overrides this TCP connection method; only explicit
         # integration tests may open a real Redis connection.

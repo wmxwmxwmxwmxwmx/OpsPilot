@@ -1,0 +1,17 @@
+apiVersion: 1
+datasources:
+  - name: OpsPilot Prometheus
+    uid: opspilot-prometheus
+    type: prometheus
+    access: proxy
+    url: ${PROMETHEUS_URL}
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+  - name: OpsPilot Tempo
+    uid: opspilot-tempo
+    type: tempo
+    access: proxy
+    url: ${TEMPO_URL}
+    editable: false

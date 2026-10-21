@@ -31,6 +31,8 @@ class CacheRepository:
 
     @staticmethod
     def _log(event: str, operation: str, started: float, *, code: str | None = None) -> None:
+        from app.observability.telemetry import telemetry
+        telemetry().event("cache", event.removeprefix("cache_"))
         # No key, ID, prefix, URL, exception text, payload or configured credentials.
         log_event(event, cache_type="incident_summary", operation=operation, code=code,
                   latency_ms=round((perf_counter() - started) * 1000, 3))

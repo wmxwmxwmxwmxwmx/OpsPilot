@@ -49,6 +49,11 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         config = settings if settings is not None else Settings()
         configure_logging()
+        from app.observability.telemetry import Telemetry
+        from app.observability.tracing import create_provider
+        provider = create_provider(config) if config.tracing_enabled else None
+        application.state.telemetry = Telemetry(metrics=config.metrics_enabled, provider=provider)
+        application.state.telemetry_settings = config
         async with httpx.AsyncClient(follow_redirects=False) as client:
             model = llm if llm is not None else (
                 MockLLM() if config.llm_mode == "mock" else OpenAICompatibleLLM(config, client)
@@ -103,16 +108,33 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                     application.state.incident_queries = IncidentQueryService(
                         application.state.incidents, application.state.incident_cache,
                     )
+                retriever = None
+                if config.rag_enabled:
+                    from app.knowledge.embeddings import build_embedding
+                    from app.knowledge.repository import RunbookRepository
+                    from app.knowledge.retriever import Retriever
+                    if engine is None:
+                        engine = create_database_engine(config.database_url.get_secret_value())
+                    retriever = Retriever(RunbookRepository(engine), build_embedding(config, client),
+                        top_k=config.rag_top_k, max_chars=config.rag_max_context_chars,
+                        min_score=config.rag_min_score, timeout=config.rag_timeout_seconds)
+                mcp = None
+                if config.mcp_enabled:
+                    from app.mcp.client import MCPClient
+                    mcp = MCPClient(config.mcp_server_url, config.mcp_timeout_seconds)
                 if config.workflow_enabled:
                     from app.workflow.runtime import workflow_service
                     if engine is None:
                         engine = create_database_engine(config.database_url.get_secret_value())
                     application.state.workflows = await workflow_stack.enter_async_context(
                         workflow_service(config, engine, model if config.llm_mode != "mock" or llm else None,
-                                         application.state.sessions))
+                                         application.state.sessions, retriever=retriever, mcp=mcp))
                     application.state.workflow_token = config.workflow_api_token.get_secret_value()
                 yield
             finally:
+                if provider is not None:
+                    import asyncio
+                    await asyncio.to_thread(provider.shutdown)
                 try:
                     await workflow_stack.aclose()
                 finally:
@@ -123,7 +145,7 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
                         if redis_client is not None:
                             await redis_client.aclose()
 
-    application = FastAPI(title="OpsPilot", version="0.3.0", lifespan=lifespan)
+    application = FastAPI(title="OpsPilot", version="0.4.0", lifespan=lifespan)
     application.include_router(health_router)
     application.include_router(diagnose_router)
     application.include_router(sessions_router)
@@ -172,6 +194,8 @@ def create_app(settings: Settings | None = None, *, llm: BaseLLM | None = None) 
             "code": "invalid_request", "message": message,
         }})
 
+    from app.observability.http import ObservabilityMiddleware
+    application.add_middleware(ObservabilityMiddleware)
     application.add_middleware(RequestLoggingMiddleware)
 
     return application

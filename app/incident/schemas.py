@@ -11,6 +11,7 @@ MAX_RECORD_BYTES = 131072
 ToolName = Literal[
     "get_system_metrics", "get_mysql_slow_queries", "get_redis_metrics", "unregistered_tool",
     "propose_mock_remediation",
+    "mcp_get_mock_system_metrics", "mcp_get_mock_redis_metrics", "mcp_get_mock_mysql_status",
 ]
 ToolErrorCode = Literal[
     "tool_not_found", "invalid_tool_arguments", "tool_timeout", "tool_execution_error",

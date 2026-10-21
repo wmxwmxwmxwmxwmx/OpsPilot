@@ -1,3 +1,4 @@
+from app.observability.telemetry import observed
 import asyncio
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -23,6 +24,7 @@ class IncidentRepository:
         self._sessions = sessions
         self._secrets = secrets
 
+    @observed("persistence", "incident")
     async def create_completed(
         self, *, session_id: UUID | None, question: str, answer: str,
         step_summary: StepSummary, duration_ms: int,

@@ -48,6 +48,7 @@ async def database():
         test_url = parsed.set(database=name).render_as_string(hide_password=False)
         engine = create_database_engine(test_url)
         async with engine.begin() as connection:
+            await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             await connection.run_sync(migrate)
         yield engine, test_url
     finally:

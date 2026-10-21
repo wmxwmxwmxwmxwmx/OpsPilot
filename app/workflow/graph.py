@@ -1,3 +1,4 @@
+from app.observability.telemetry import observed
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
@@ -25,9 +26,10 @@ def build_graph(nodes, checkpointer):
     builder = StateGraph(GraphState)
     retry = RetryPolicy(max_attempts=3, initial_interval=0.05, backoff_factor=2,
                         max_interval=0.2, jitter=False, retry_on=TransientWorkflowError)
-    for name in ("plan", "validate_tool", "human_approval", "execute_tool", "finalize"):
-        builder.add_node(name, getattr(nodes, name), retry_policy=retry if name in {"plan", "execute_tool"} else None)
-    builder.add_edge(START, "plan")
+    for name in ("retrieve_runbook", "plan", "validate_tool", "human_approval", "execute_tool", "finalize"):
+        builder.add_node(name, observed("node", name)(getattr(nodes, name)), retry_policy=retry if name in {"plan", "execute_tool"} else None)
+    builder.add_edge(START, "retrieve_runbook")
+    builder.add_edge("retrieve_runbook", "plan")
     builder.add_conditional_edges("plan", after_plan, ["finalize", "validate_tool"])
     builder.add_conditional_edges("validate_tool", after_validation, ["human_approval", "execute_tool"])
     builder.add_conditional_edges("human_approval", after_approval, ["execute_tool", "validate_tool", "plan"])

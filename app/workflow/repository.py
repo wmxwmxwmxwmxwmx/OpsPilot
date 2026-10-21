@@ -1,3 +1,4 @@
+from app.observability.telemetry import observed
 """Workflow mutex + business commits. Never holds a row transaction over LLM IO."""
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -80,6 +81,7 @@ class WorkflowRepository:
                 raise WorkflowError("operation_conflict")
             return row["result"]
 
+    @observed("persistence", "incident")
     async def complete(self, workflow_id: str, state: dict, session_status: str):
         summary = SummaryBuilder()
         for result in state["tool_results"]:

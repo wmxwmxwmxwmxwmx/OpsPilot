@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from uuid import UUID
 
+from app.observability.telemetry import operation, execution_events
 from app.agent.events import AgentEvent, FinalAnswerEvent
 from app.agent.loop import Agent
 from app.agent.schemas import DiagnoseResponse, ToolResultStep
@@ -63,6 +64,26 @@ class DiagnosisService:
         return incident.id
 
     async def run(self, message: str, session_id: UUID | None = None) -> DiagnoseResponse:
+        from app.observability.telemetry import telemetry
+        obs = telemetry()
+        obs.event("agent", "started")
+        outcome = "failed"
+        if obs.metrics:
+            obs.active.labels("agent").inc()
+        try:
+            with operation("agent", "execution"):
+                result = await self._run(message, session_id)
+                outcome = "completed"
+                return result
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            obs.event("agent", outcome)
+            if obs.metrics:
+                obs.active.labels("agent").dec()
+
+    async def _run(self, message: str, session_id: UUID | None = None) -> DiagnoseResponse:
         snapshot = await self.require_sessions().load(session_id) if session_id is not None else None
         created_at, started = datetime.now(timezone.utc), perf_counter()
         result = (await self.agent.run(message, history=snapshot.messages) if snapshot is not None
@@ -76,6 +97,11 @@ class DiagnosisService:
         return result.model_copy(update={"incident_id": incident_id}) if incident_id else result
 
     async def stream(self, message: str, session_id: UUID | None = None) -> AsyncIterator[AgentEvent]:
+        async with aclosing(execution_events(self._stream(message, session_id), "agent")) as events:
+            async for event in events:
+                yield event
+
+    async def _stream(self, message: str, session_id: UUID | None = None) -> AsyncIterator[AgentEvent]:
         snapshot = await self.require_sessions().load(session_id) if session_id is not None else None
         created_at, started = datetime.now(timezone.utc), perf_counter()
         summary = SummaryBuilder()

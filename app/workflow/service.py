@@ -78,6 +78,13 @@ class WorkflowService:
         return result
 
     async def stream(self, workflow_id, *, action="resume", approval=None):
+        from app.observability.telemetry import execution_events
+        async with aclosing(execution_events(self._stream(workflow_id, action=action, approval=approval),
+                                            "workflow", workflow_id=workflow_id)) as events:
+            async for event in events:
+                yield event
+
+    async def _stream(self, workflow_id, *, action="resume", approval=None):
         async with self.repository.lock(workflow_id):
             row = await self.repository.get(workflow_id)
             if row["status"] in {"completed", "cancelled"}:

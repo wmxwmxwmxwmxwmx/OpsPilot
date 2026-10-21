@@ -18,6 +18,8 @@ def merge_results(left: list[dict], right: list[dict]) -> list[dict]:
 
 
 class GraphState(TypedDict):
+    runbook_chunks: list[dict]
+    retrieval_status: str
     schema_version: int
     workflow_id: str
     session_id: str | None

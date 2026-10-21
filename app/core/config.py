@@ -41,6 +41,30 @@ class Settings(BaseSettings):
     cache_max_bytes: int = Field(default=65536, ge=1, le=1048576)
     cache_io_timeout_seconds: float = Field(default=0.5, gt=0, le=10)
 
+    rag_enabled: bool = False
+    rag_top_k: int = Field(default=4, ge=1, le=10)
+    rag_max_context_chars: int = Field(default=4000, ge=128, le=12000)
+    rag_min_score: float = Field(default=0.35, ge=-1, le=1)
+    rag_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    rag_runbook_path: str = "runbooks"
+    rag_chunk_size: int = Field(default=1000, ge=128, le=8000)
+    rag_chunk_overlap: int = Field(default=120, ge=0)
+    rag_embedding_provider: Literal["fake", "api"] = "fake"
+    rag_embedding_model: str = "fake-hash-v1"
+    rag_embedding_dimensions: int = Field(default=64, ge=8, le=4096)
+    rag_embedding_base_url: str = ""
+    rag_embedding_api_key: SecretStr = SecretStr("")
+    mcp_enabled: bool = False
+    mcp_server_url: str = "http://127.0.0.1:8765/mcp"
+    mcp_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    metrics_enabled: bool = False
+    metrics_token: SecretStr = SecretStr("")
+    metrics_allowed_cidrs: list[str] = ["127.0.0.0/8", "::1/128"]
+    tracing_enabled: bool = False
+    otel_service_name: str = "opspilot"
+    otel_exporter_otlp_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    trace_sample_ratio: float = Field(default=1.0, ge=0, le=1)
+
     @model_validator(mode="after")
     def validate_provider(self) -> Self:
         if self.agent_engine == "langgraph":
@@ -51,6 +75,32 @@ class Settings(BaseSettings):
             validate_database_url(self.database_url.get_secret_value())
             from app.workflow.checkpoint import validate_checkpoint_url
             validate_checkpoint_url(self.checkpoint_database_url.get_secret_value())
+        if (self.rag_enabled or self.mcp_enabled) and not self.workflow_enabled:
+            raise ValueError("RAG/MCP requires WORKFLOW_ENABLED and the Workflow API")
+        if self.rag_enabled:
+            validate_database_url(self.database_url.get_secret_value())
+        if self.rag_chunk_overlap >= self.rag_chunk_size // 2:
+            raise ValueError("RAG overlap must be less than half chunk size")
+        if self.rag_embedding_provider == "api":
+            url = urlsplit(self.rag_embedding_base_url)
+            if (url.scheme not in {"http", "https"} or not url.hostname or url.username
+                    or url.password or url.query or url.fragment or not self.rag_embedding_model
+                    or not self.rag_embedding_api_key.get_secret_value()):
+                raise ValueError("Embedding API requires an explicit URL, model and key")
+        if self.rag_embedding_provider == "fake" and self.rag_embedding_model != "fake-hash-v1":
+            raise ValueError("Fake embeddings must use fake-hash-v1")
+        if self.mcp_enabled:
+            from app.mcp.client import validate_server_url
+            validate_server_url(self.mcp_server_url)
+        import ipaddress
+        for cidr in self.metrics_allowed_cidrs:
+            ipaddress.ip_network(cidr, strict=True)
+        if self.metrics_token.get_secret_value() and len(self.metrics_token.get_secret_value()) < 32:
+            raise ValueError("Metrics token must contain at least 32 characters")
+        if self.tracing_enabled:
+            url = urlsplit(self.otel_exporter_otlp_endpoint)
+            if url.scheme not in {"http", "https"} or not url.hostname or url.username or url.password or url.query:
+                raise ValueError("OTLP requires an explicit HTTP endpoint without credentials")
         validate_key_prefix(self.cache_key_prefix)
         if self.cache_enabled and not self.incident_persistence_enabled:
             raise ValueError("CACHE_ENABLED requires INCIDENT_PERSISTENCE_ENABLED")

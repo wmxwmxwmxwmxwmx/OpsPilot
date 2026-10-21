@@ -4,6 +4,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from app.knowledge.models import RunbookDocumentRow, RunbookChunkRow  # noqa: F401
 from app.db.base import Base
 from app.db.config import MigrationSettings
 from app.db.models import IncidentRow  # noqa: F401 -- register metadata

@@ -1,3 +1,4 @@
+from app.observability.telemetry import operation, telemetry
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
@@ -69,7 +70,9 @@ class Agent:
                 log_event("agent_step", step=round_number)
                 try:
                     async with asyncio.timeout(self.llm_timeout_seconds):
-                        response = await self.llm.generate(messages, definitions)
+                        telemetry().event("agent", "loop")
+                        with operation("llm", "generate"):
+                            response = await self.llm.generate(messages, definitions)
                 except TimeoutError:
                     log_event("llm_failure", code="llm_timeout")
                     raise AgentExecutionError("llm_timeout", "模型调用超时，请稍后重试。", steps) from None
@@ -129,7 +132,8 @@ class Agent:
             await asyncio.sleep(0)  # Give disconnect cancellation a chance before IO.
             try:
                 async with asyncio.timeout(self.tool_timeout_seconds):
-                    result = await tool.execute(arguments)
+                    with operation("tool", tool.name):
+                        result = await tool.execute(arguments)
                 # Validate the observation before adding it to the model context.
                 json.dumps(result, allow_nan=False)
                 if not isinstance(result, dict):

@@ -535,3 +535,176 @@ M4 的 Redis 客户端复用只涉及连接资源，SessionRepository 的异常�
 - 对 completed 执行 prune，然后确认 Incident 仍存在；对 pending_approval 执行 prune，确认审批没有被删。
 - 阅读旧 `SessionRepository.commit` 与新的 `commit_session`：前者语义保留，后者增加独立回执以处理长工作流重试。
 - 检查 `JsonPlusSerializer` 的严格设置：禁用 pickle，禁止任意应用类型恢复；框架安全内置类型仍可用于 interrupt。
+
+## V0.4：结合实现理解 RAG、MCP 和可观测性
+
+### RAG：知识不是实时证据
+
+**RAG 是什么？** Retrieval Augmented Generation 是先检索相关资料，再让生成模型结合资料回答。
+本项目入口是 `WorkflowNodes.retrieve_runbook()`，而不是独立问答 Demo。Graph 的 START 先到检索节点，
+再到原有 `plan → validate_tool → execute_tool / human_approval` 循环；检索结束仍需要工具获取证据。
+关键词门控仅是可解释的初版策略，不是真实 LLM 意图分类器。
+
+**Embedding 是什么？** 将文本变为固定维度数值向量，使相似文本在某种距离度量下更接近。
+`EmbeddingProvider` 把模型 ID、维度和校验与数据库解耦。`APIEmbedding` 使用已有 httpx 客户端访问明确
+配置的 API；`FakeEmbedding` 用 token hash 生成确定向量，只验证代码路径，不具备经过验证的语义能力。
+只有独立 `test_embedding_live.py` 使用真实 API 并要求 Redis 命中率手册排名第一；它不使用 fake 补位。
+
+**为何 Chunking？** 将整个知识库直接放入 Prompt 会扩大成本、噪声和泄露面。
+`load_documents()` 保留文档 ID、路径、标题、版本、组件、更新时间；`split_document()` 按 Markdown
+标题维护章节路径，优先在段落边界切分，对过长段落做长度截断。Chunk ID 是文档 ID、版本、章节、偏移和
+内容摘要的稳定 hash；相同导入不产生随机新 ID。默认最多 1000 字符，不是 token 数。
+
+**Overlap 有什么作用？** 相邻块重叠 120 字符可以减少长段落在边界丢失上下文，但也增加向量存储、
+Embedding 费用和重复召回。当前只在同章节长块之间重叠，不跨标题无差别复制。重叠不能保证句子完全保留，
+更精细的语言/token splitter 仍属后续优化。
+
+**pgvector 如何检索？** `RunbookRepository.search()` 使用 `1 - cosine_distance` 为分数，精确排序再 LIMIT。
+MATERIALIZED CTE 先过滤 embedding_model/dimensions，避免对不同维度执行距离运算；数据库还用
+`vector_dims(embedding) = dimensions` 检查实际长度。小文档库无需凭空增加 HNSW。
+参见 [pgvector 官方说明](https://github.com/pgvector/pgvector)。
+
+**Top-K、召回和相关性是什么？** Top-K 是最多返回 K 个候选，不代表 K 个都正确。
+Retriever 还执行 min_score、去重和总内容预算；空命中允许明确无可靠手册。召回率关注相关资料有没有被找到，
+相关性关注返回资料是否有用；必须用有标注的问题集和真实模型测量，不能从 fake 的 deterministic 通过率推断。
+相似度阈值跨模型不可直接复用。当前演示中 fake 可能把 Linux CPU 段落也召回，这是已记录的限制。
+
+**文档更新如何处理？** `import_runbooks()` 对来源路径、内容、切分配置计算指纹，连同模型/维度判断是否变化。
+变更时只重新嵌入该文档，用 `replace()` 在文档级 advisory lock 和单事务中替换旧块。没有每次查询嵌入全库。
+模型升级需要重导入；不同模型向量不能混用。每文档替换不等于整个知识库原子发布，删文件也不会自动删索引；
+版本回滚和离线索引切换需要维护流程。
+
+**如何防止 Runbook Prompt Injection？** 资料放入非 system 消息，系统说明要求忽略资料中的操作指令，
+参数/工具安全仍由本地注册目录和原审批节点决定。`render_references()` 仅从检索状态生成正式引用，省略
+模型伪造的 Markdown 文件来源。工具没有任意命令能力，RAG 不提供审批捷径。低信任角色隔离与引用过滤
+只能降低风险，不能证明模型一定不会被误导；文档准入、人工复核、最小权限仍必要。
+
+**为何不能替代实时诊断？** Runbook 只说明“可能检查 TTL 和淘汰”，不能证明当前已经发生淘汰。
+本次 MCP 返回模拟 hit_rate=0.42，回答明确 Mock Data、无法确定根因、未执行修复；真实系统需要真实授权
+指标、时间窗口和变更记录才能建立因果证据。
+
+### MCP：工具协议与权限边界
+
+**MCP 是什么，Server/Client 有何区别？** MCP 是客户端与工具/资源服务交互的标准协议。
+`app/mcp/server.py` 用官方 v2 `MCPServer` 暴露三个模拟工具；`MCPClient` 连接服务、执行 discovery 和 call。
+它与 Python 函数的差别在于多了传输、序列化、协议协商、网络超时、取消、服务身份和信任边界。
+SDK 升级要连同 Server、Client、类型字段和 transport 一起测试，不能复制 v1 FastMCP 例子到 v2 混用。
+
+**Tool Discovery 怎么工作？** `list_tools()` 返回工具名称、描述和 JSON Schema。
+`register_tools()` 仅接纳 `CATALOG` 已审阅名称，`MCPTool` 将其转换成现有 Tool 接口，使用本地描述和
+`EmptyInput` 参数模型，同时用 JSON Schema 再校验。发现远端工具不等于授权它执行。
+远端 `read_only` annotations 也不能覆盖本地策略；未知描述不能进入系统指令。
+
+**Transport 是什么，Streamable HTTP 与 SSE 有何区别？** Transport 定义协议消息如何跨进程传输。
+本版默认 Streamable HTTP，通过 `/mcp` HTTP 请求执行 MCP 消息；协议内部可能用 SSE 承载流。
+旧 MCP SSE transport 不是新默认协议。OpsPilot `/workflows?stream=true` 的 SSE 是向用户推送 AgentEvent，
+和 Agent 到 MCP Server 的通信不是同一层。当前没有新增 stdio 配置。
+
+**怎样进入 LangGraph？** 模型得到 `mcp_get_mock_redis_metrics` ToolDefinition，原 `plan` 规范化 call ID，
+`validate_tool` 校验参数/安全分类，`execute_tool` 调 Adapter，Client 发远端 `get_mock_redis_metrics`，
+Adapter 投影数值结果，再经原 observation/ToolResult 进入消息和 Checkpoint。
+`WorkflowMockLLM` 的 Redis 路径用于确定性验收；它不是语义理解或真实模型推理。
+
+**有哪些权限风险？** 任意 URL 带来 SSRF，任意 discovery 带来工具注入，过大结果消耗内存，远端文字
+可能包含凭据或指令。本版限定显式本机 IP/端口、精确 `/mcp`、禁用重定向和代理环境继承，限制 discovery、
+Schema、64 KiB HTTP 输出和参数，最终只保留审阅过的数字字段。默认不提供远端认证，因为这是本机开发服务；
+“本机”也不等于可信多用户环境。跨主机服务需认证、TLS、工具能力授权和网络隔离。
+
+**副作用与恢复如何兼容？** 当前 MCP 目录仅只读；未知写工具 fail closed。原 MockRemediationTool 仍在
+`human_approval` 中等待，并用 operation ID 和数据库唯一约束幂等登记。没有为 MCP 另造审批系统，也没有
+声称外部写动作拥有 exactly-once。每次 MCP 操作用有界会话，跨请求 resume 创建新连接上下文；网络异常
+转安全业务错误，不输出远端异常原文。CancelledError 继续传播。
+
+### Prometheus：计数的边界比图表更重要
+
+**Metrics 是什么？** Metrics 是可聚合的数值样本，适合观察吞吐、失败和耗时分布。
+`Telemetry` 的 Counter/Gauge/Histogram 使用私有注册表；`ObservabilityMiddleware` 在请求期通过 ContextVar
+绑定当前应用实例，让同一业务代码中的 operation/event 更新正确的 registry。
+
+**三种类型如何选择？** Counter 累计完成的事件，可重启归零，使用 rate 处理重启；Gauge 代表可增可减
+当前值；Histogram 分桶记录分布，生成 `_bucket/_sum/_count`。
+本项目 `opspilot_events_total` 记录开始/完成/失败/恢复/等待审批，`opspilot_active_executions` 记录正在执行
+的请求段，`opspilot_operation_duration_seconds` 记录操作秒数。等待人工审批的持久状态不是活跃 Gauge。
+
+**什么是 Label Cardinality？** 每个 label 组合都是一条新时序。workflow_id、用户问题和 trace_id 无界增长，
+不能作为 label；工具名和路由模板必须来自受控集合。未匹配 URL 统一 `unmatched`，动态 UUID 路径保留模板。
+`test_unknown_paths_and_untrusted_tool_names_do_not_create_metric_labels` 验证用户路径和未知工具名不出现在指标。
+
+**Scrape 如何获取 FastAPI 指标？** Prometheus 定时 GET `/metrics`，应用返回当前 registry 文本，Prometheus
+再存储时序；Grafana 只查询。服务发现成功不等于 scrape 成功，必须检查 `/api/v1/targets` 的 health。
+容器 localhost 不等于 WSL localhost，peer allowlist 必须与真实监控网络对应，不能信任伪造 X-Forwarded-For。
+
+**如何计算错误率和 P95？** Dashboard 使用真实名称：
+
+```promql
+sum(rate(opspilot_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(opspilot_http_requests_total[5m])), 0.001)
+histogram_quantile(0.95, sum by (le) (rate(opspilot_http_duration_seconds_bucket[5m])))
+sum by (operation) (rate(opspilot_operations_total{component="tool",outcome="error"}[5m]))
+sum by (event) (rate(opspilot_events_total{component="workflow",event=~"completed|failed|pending_approval|resumed"}[5m]))
+```
+
+先 rate，再 sum，保留 Histogram 的 `le` 桶上界；不能直接平均不同实例的 P95。短窗口少样本会 NaN，
+没有错误事件的系列可能为空，不能捏造零样本。Counter 类型的 `_total` 与 Histogram 的 `_count` 不同。
+
+**HTTP 200 为什么不代表 Agent 成功？** SSE headers 提前发送后无法因为后续失败改 HTTP 状态。
+`execution_events()` 根据业务终态计数，只有持久化成功才 completed；`pending_approval` 不是 completed。
+`DiagnosisService` 在 Session/Incident 提交后才统计旧 Agent 成功。Tool 调用异常与 Agent 最终回答可能是两个
+不同结果，例如旧 Agent 可以带着工具错误生成“证据不足”的最终回答。
+
+**Metrics 与 Logging 有何区别？** Metrics 适合聚合趋势，日志适合离散事件上下文；高基数 ID 可在受控日志
+或 Trace 中关联，不能搬进 Prometheus label。Cache 事件在现有 `_log()` 边界附加计数，避免再次实现回源逻辑。
+多 worker 部署若只 scrape 任意一个 worker 的 registry，会漏计或跳动；当前只验收单进程，不能直接扩大 workers。
+
+### Grafana：版本化可视化与实际验收
+
+**Grafana 做什么、存储什么？** 它负责数据源、面板和查询呈现；存储 Dashboard/用户配置，时序数据由
+Prometheus 存储，Trace 由 Tempo 存储。打开登录页仅证明 Web 服务运行。
+
+**PromQL 是什么？** Prometheus 的查询表达式语言。`rate()` 估算增长速度，`sum by()` 按维度聚合，
+`histogram_quantile()` 根据桶计算分位数。JSON 面板引用同一组真实 metric 名称，图表为空要先分辨
+没有请求、没有 scrape、选择器不匹配、没有错误事件或窗口样本不足。
+
+**Dashboard 如何管理？** `deploy/observability/grafana/dashboards/opspilot.json` 是 Git 中的定义，
+provisioning 在启动时载入数据源和 Dashboard，UID 固定便于引用。运行时 URL/path 用环境变量替换，
+Compose 和原生二进制可复用同一文件。UI 修改不会作为正式源，避免重启后丢失配置。
+
+**怎样验收链路？** `python -m app.cli.observability_check`：创建 Workflow，确认引用、读取 X-Trace-ID，轮询 target UP 和
+Histogram，检查两数据源 health，读取 provisioned Dashboard，再经 Grafana 的代理查询 Prometheus 和 Tempo。
+受控 `--fail-redis` 演示验证错误数增长；正常重启后 resume 验证恢复。无需部署真实故障注入接口。
+
+### Agent Trace：一次执行的父子关系
+
+**Trace、Span、ID 分别是什么？** Trace 是一次分布式执行的关联集合，trace_id 标识集合；Span 表示有开始、
+结束和属性的一段操作，span_id 标识段，parent_span_id 表示因果父段。Workflow ID 是长期业务身份，不能
+替代短期执行 Trace。`X-Trace-ID` 便于从 HTTP 结果跳到 Grafana Explore。
+
+**父子 Span 如何建立？** `operation()` 用当前 tracer 创建子 Span；ASGI middleware 创建 HTTP SERVER Span，
+`execution_events()` 创建 Workflow Span，节点内的 LLM、RAG、Embedding、向量查询、工具和持久化继承当前
+上下文。测试 InMemorySpanExporter 验证真实 span_id 关系，不只比名字。
+
+**Context Propagation 是什么？** 另一个进程不会自动继承本进程 ContextVar。`MCPClient.connection()` 将
+W3C Trace Context 注入 HTTP header，服务 middleware 提取；SDK 的请求 `_meta` 也携带 W3C context。
+MCP v2 在处理工具时可能采用 `_meta` 的父段，因此远端工具可直接成为 client call 的子段，HTTP transport
+Span 则与它同 Trace。真实 loopback HTTP 测试检查祖先链，而不是错误地要求固定的一层包装结构。
+
+**异步链路怎么避免串线？** OpenTelemetry 通过上下文传播跟随 asyncio task，但异步生成器跨 `yield` 的
+attach/detach 容易在不同消费者任务里发生。这里仅在推进 `anext` 和 `aclose` 期间 `use_span`，yield 前 detach，
+整体 Span 最终显式 end。middleware 最后 reset Telemetry ContextVar，取消不吞掉，shield 仍只用于原数据库
+清理边界。Span 不写入 Checkpoint。
+
+**为何 Resume 是新 Trace？** 审批等待可能数小时，原 HTTP 请求已关闭。下一次 resume 有新 HTTP/执行
+Trace，通过 `workflow.id`、`thread.id` 属性找到同一任务；已经完成的节点无需重跑，因此新 Trace 可能没有
+RAG/首次规划段。这不是观测丢失。当前未实现 Span Links，只提供属性关联。
+
+**Trace 与结构化日志的区别？** 日志提供事件记录，Trace 提供有时长和父子关系的执行结构，能区分 LLM、
+Embedding、数据库、MCP 哪一段慢。request_id 日志本身不是分布式 Trace；跨进程使用同一个 trace_id 但没有
+正确 parent context 也不足以证明调用层级。
+
+**Tempo 与 OTLP 的作用？** SDK 生成 Span，BatchSpanProcessor 在有界队列批量提交给 OTLP HTTP exporter；
+Tempo 接收并存储，Grafana Tempo datasource 查询。示例默认本地存储并保留 24h，正式环境需要容量、权限、
+保留、备份、可用性策略。`SafeExporter` 隔离导出异常，允许在拥塞或关闭时丢 Span，避免遥测破坏诊断。
+
+**为什么不记录完整 Prompt/ToolResult？** 它们可能包含用户隐私、凭据、业务拓扑和低信任注入文本；
+Trace 访问范围通常与业务数据库不同。代码显式禁用自动异常正文录制，只记录受控名称、终态和 Workflow ID，
+不凭空猜 token usage。采样减少成本但会漏诊断，敏感属性与身份关联仍需最小保留原则。
+参见 [OpenTelemetry Python instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/)。
