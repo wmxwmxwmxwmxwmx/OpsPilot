@@ -1724,3 +1724,19 @@ pytest -q tests/test_embedding_live.py
 当前限制：真实语义质量仍需配置 API 后验证；检索策略为简单关键词门控和向量 Top-K，没有 reranker；
 MCP 仅本机审阅只读工具；共享 token 不是 RBAC/多租户认证；没有生产变更或自动修复。
 知识/Trace 的访问控制、备份、脱敏、保留策略和采样成本都需要生产部署另行设计。
+
+## 轻量前端 Demo Console
+
+新增 [React + TypeScript + Vite 控制台](frontend/README.md)，在本地演示诊断聊天、SSE 事件、
+多轮 Session、HITL 批准 / 拒绝 / 恢复和 Grafana Trace。Node.js 22.12+ 环境下：
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+访问 `http://127.0.0.1:5173`，默认代理本地 `8000` 端口的 FastAPI。
+基础诊断无需额外存储；多轮会话依赖 Redis；Workflow 需要按前文初始化 PostgreSQL / Checkpoint，
+在页面的连接设置中输入后端 `WORKFLOW_API_TOKEN`。模型密钥只放在后端，工具数据仍为模拟数据。
+完整配置、演示步骤与验证命令见 [frontend/README.md](frontend/README.md)。

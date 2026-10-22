@@ -14,3 +14,7 @@ htmlcov/
 venv/
 .vscode/
 .runtime-v04/
+node_modules/
+playwright-report/
+test-results/
+*.tsbuildinfo

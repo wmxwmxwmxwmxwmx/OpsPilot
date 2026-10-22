@@ -46,10 +46,10 @@ async def stream_events(service, workflow_id, **kwargs):
 
 
 @router.post("")
-async def create(payload: DiagnoseRequest, service: Service, stream: bool = False):
+async def create(payload: DiagnoseRequest, service: Service, stream: bool = False, progress: bool = False):
     workflow_id = await service.create(payload.message, payload.session_id)
     if stream:
-        return SSEResponse(stream_events(service, workflow_id, action="start"))
+        return SSEResponse(stream_events(service, workflow_id, action="start", include_progress=progress))
     return await service.run(workflow_id, action="start")
 
 
@@ -59,15 +59,16 @@ async def status(workflow_id: UUID4, service: Service):
 
 
 @router.post("/{workflow_id}/resume")
-async def resume(workflow_id: UUID4, service: Service, stream: bool = False):
+async def resume(workflow_id: UUID4, service: Service, stream: bool = False, progress: bool = False):
     if stream:
-        return SSEResponse(stream_events(service, str(workflow_id)))
+        return SSEResponse(stream_events(service, str(workflow_id), include_progress=progress))
     return await service.run(str(workflow_id))
 
 
 @router.post("/{workflow_id}/approval")
-async def approve(workflow_id: UUID4, payload: ApprovalRequest, service: Service, stream: bool = False):
+async def approve(workflow_id: UUID4, payload: ApprovalRequest, service: Service, stream: bool = False,
+                  progress: bool = False):
     kwargs = {"action": "approve", "approval": payload.model_dump(mode="json")}
     if stream:
-        return SSEResponse(stream_events(service, str(workflow_id), **kwargs))
+        return SSEResponse(stream_events(service, str(workflow_id), include_progress=progress, **kwargs))
     return await service.run(str(workflow_id), **kwargs)

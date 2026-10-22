@@ -12,7 +12,7 @@ from app.agent.schemas import ToolCallStep, ToolResultStep
 from app.core.logging import log_event
 from app.session.errors import SessionError
 from app.workflow.errors import WorkflowError
-from app.workflow.events import WorkflowEvent
+from app.workflow.events import NodeProgressEvent, WorkflowEvent
 from app.workflow.session_commit import commit_session
 from app.workflow.state import checked_update
 
@@ -77,14 +77,15 @@ class WorkflowService:
             result["answer"] = answer
         return result
 
-    async def stream(self, workflow_id, *, action="resume", approval=None):
+    async def stream(self, workflow_id, *, action="resume", approval=None, include_progress=False):
         from app.observability.telemetry import execution_events
-        async with aclosing(execution_events(self._stream(workflow_id, action=action, approval=approval),
+        async with aclosing(execution_events(self._stream(workflow_id, action=action, approval=approval,
+                                                         include_progress=include_progress),
                                             "workflow", workflow_id=workflow_id)) as events:
             async for event in events:
                 yield event
 
-    async def _stream(self, workflow_id, *, action="resume", approval=None):
+    async def _stream(self, workflow_id, *, action="resume", approval=None, include_progress=False):
         async with self.repository.lock(workflow_id):
             row = await self.repository.get(workflow_id)
             if row["status"] in {"completed", "cancelled"}:
@@ -117,9 +118,15 @@ class WorkflowService:
                 if not has_checkpoint or saved.next:
                     with tracing_context(enabled=False):
                         source = self.graph.astream(graph_input, self.config(workflow_id),
-                                                    stream_mode="updates", durability="sync")
+                                                    stream_mode=["updates", "custom"] if include_progress else "updates",
+                                                    durability="sync")
                         async with aclosing(source) as updates:
                             async for update in updates:
+                                if include_progress:
+                                    mode, update = update
+                                    if mode == "custom":
+                                        yield NodeProgressEvent.model_validate(update)
+                                        continue
                                 # Only updates from THIS invocation become events.
                                 # Historical state/results are never replayed as SSE.
                                 for node, delta in update.items():

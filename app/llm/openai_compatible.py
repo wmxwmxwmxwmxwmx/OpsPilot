@@ -30,10 +30,13 @@ class OpenAICompatibleLLM(BaseLLM):
     async def generate(
         self, messages: list[Message], tools: list[ToolDefinition]
     ) -> LLMResponse:
+        from urllib.parse import urlsplit
         payload: dict[str, Any] = {
             "model": self._settings.openai_model,
             "messages": [self._serialize_message(message) for message in messages],
         }
+        if urlsplit(self._settings.openai_base_url).hostname == "api.deepseek.com":
+            payload["thinking"] = {"type": "disabled"}
         if tools:
             payload["tools"] = [{"type": "function", "function": tool.model_dump()} for tool in tools]
             payload["tool_choice"] = "auto"
